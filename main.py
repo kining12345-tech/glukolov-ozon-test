@@ -1,9 +1,11 @@
 import os
+import re
 import json
 import urllib.request
 import urllib.error
 import urllib.parse
 import http.cookiejar
+from html import unescape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = int(os.environ.get("PORT", "8080"))
@@ -19,34 +21,80 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def make_opener(use_proxy=True, cookies=None):
-    handlers = [NoRedirect()]
+def make_opener(cookies=None):
+    if not all([PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS]):
+        raise RuntimeError("Proxy environment variables are missing")
 
-    if use_proxy:
-        if not all([PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS]):
-            raise RuntimeError("Proxy environment variables are missing")
+    user = urllib.parse.quote(PROXY_USER, safe="")
+    password = urllib.parse.quote(PROXY_PASS, safe="")
+    proxy_url = f"http://{user}:{password}@{PROXY_HOST}:{PROXY_PORT}"
 
-        credentials = urllib.parse.quote(PROXY_USER, safe="")
-        password = urllib.parse.quote(PROXY_PASS, safe="")
-
-        proxy_url = (
-            f"http://{credentials}:{password}"
-            f"@{PROXY_HOST}:{PROXY_PORT}"
-        )
-
-        handlers.append(
-            urllib.request.ProxyHandler({
-                "http": proxy_url,
-                "https": proxy_url,
-            })
-        )
+    handlers = [
+        NoRedirect(),
+        urllib.request.ProxyHandler({
+            "http": proxy_url,
+            "https": proxy_url,
+        }),
+    ]
 
     if cookies is not None:
-        handlers.append(
-            urllib.request.HTTPCookieProcessor(cookies)
-        )
+        handlers.append(urllib.request.HTTPCookieProcessor(cookies))
 
     return urllib.request.build_opener(*handlers)
+
+
+def analyze_html(body):
+    text = re.sub(r"(?is)<script\b.*?</script>", " ", body)
+    text = re.sub(r"(?is)<style\b.*?</style>", " ", text)
+    text = re.sub(r"(?is)<svg\b.*?</svg>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    title_match = re.search(
+        r"(?is)<title[^>]*>(.*?)</title>",
+        body
+    )
+    title = ""
+    if title_match:
+        title = re.sub(r"\s+", " ", unescape(title_match.group(1))).strip()
+
+    markers = {
+        "captcha": bool(re.search(r"captcha|капч|验证码", body, re.I)),
+        "cloudflare": bool(re.search(
+            r"cloudflare|cf-chl-|challenges.cloudflare.com",
+            body,
+            re.I
+        )),
+        "access_denied": bool(re.search(
+            r"access denied|доступ ограничен|доступ запрещён|доступ запрещен",
+            text,
+            re.I
+        )),
+        "robot_check": bool(re.search(
+            r"провер.*(робот|человек)|подтвердите, что вы человек|are you human|verify you are human",
+            text,
+            re.I
+        )),
+        "ozon_error": bool(re.search(
+            r"что-то пошло не так|ошибка|попробуйте позже",
+            text,
+            re.I
+        )),
+        "product_signals": bool(re.search(
+            r"добавить в корзину|купить|отзывы|рейтинг",
+            text,
+            re.I
+        )),
+    }
+
+    return {
+        "title": title[:300],
+        "visible_text": text[:1800],
+        "html_length": len(body),
+        "markers": markers,
+        "html_start": body[:500],
+    }
 
 
 def request_url(url, opener):
@@ -68,27 +116,26 @@ def request_url(url, opener):
 
     try:
         response = opener.open(req, timeout=30)
-        body = response.read(12000).decode("utf-8", "replace")
+        raw = response.read(50000)
+        body = raw.decode("utf-8", "replace")
 
         return {
             "status": response.status,
-            "final_url": response.geturl(),
+            "url": response.geturl(),
             "location": response.headers.get("Location"),
             "content_type": response.headers.get("Content-Type"),
-            "body_bytes": len(body),
-            "body_sample": body[:2500],
+            "analysis": analyze_html(body),
         }
 
     except urllib.error.HTTPError as e:
-        body = e.read(12000).decode("utf-8", "replace")
+        raw = e.read(50000)
+        body = raw.decode("utf-8", "replace")
 
         return {
             "status": e.code,
             "location": e.headers.get("Location"),
             "content_type": e.headers.get("Content-Type"),
-            "set_cookie": e.headers.get_all("Set-Cookie"),
-            "body_bytes": len(body),
-            "body_sample": body[:2500],
+            "analysis": analyze_html(body),
         }
 
     except Exception as e:
@@ -100,16 +147,15 @@ def request_url(url, opener):
 
 def run_test():
     results = {
-        "project": "Glukolov proxy test",
+        "project": "Glukolov proxy diagnostic v2",
         "proxy_endpoint": f"{PROXY_HOST}:{PROXY_PORT}",
     }
 
-    # 1. Проверяем внешний IP через прокси
     try:
-        opener = make_opener(use_proxy=True)
+        opener = make_opener()
         results["external_ip"] = request_url(
             "https://api.ipify.org?format=json",
-            opener,
+            opener
         )
     except Exception as e:
         results["external_ip"] = {
@@ -117,39 +163,22 @@ def run_test():
             "details": str(e)[:500],
         }
 
-    # 2. Проверяем страну выхода, если сервис доступен
-    try:
-        opener = make_opener(use_proxy=True)
-        results["ip_country"] = request_url(
-            "https://ipapi.co/json/",
-            opener,
-        )
-    except Exception as e:
-        results["ip_country"] = {
-            "error": type(e).__name__,
-            "details": str(e)[:500],
-        }
-
-    # 3. Проверяем Ozon с сохранением cookies
     try:
         jar = http.cookiejar.CookieJar()
-        opener = make_opener(use_proxy=True, cookies=jar)
+        opener = make_opener(jar)
 
         results["ozon_home_first"] = request_url(
             "https://www.ozon.ru/",
-            opener,
+            opener
         )
-
         results["ozon_home_second"] = request_url(
             "https://www.ozon.ru/",
-            opener,
+            opener
         )
-
         results["ozon_category"] = request_url(
             "https://www.ozon.ru/category/zhenskaya-odezhda-7501/",
-            opener,
+            opener
         )
-
     except Exception as e:
         results["ozon_error"] = {
             "error": type(e).__name__,
@@ -169,13 +198,13 @@ class Handler(BaseHTTPRequestHandler):
         data = json.dumps(
             payload,
             ensure_ascii=False,
-            indent=2,
+            indent=2
         ).encode("utf-8")
 
         self.send_response(200)
         self.send_header(
             "Content-Type",
-            "application/json; charset=utf-8",
+            "application/json; charset=utf-8"
         )
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -185,7 +214,6 @@ class Handler(BaseHTTPRequestHandler):
         print(fmt % args, flush=True)
 
 
-print(f"Glukolov proxy test listening on port {PORT}", flush=True)
+print(f"Glukolov proxy diagnostic v2 listening on port {PORT}", flush=True)
 
-server = HTTPServer(("0.0.0.0", PORT), Handler)
-server.serve_forever()
+HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
