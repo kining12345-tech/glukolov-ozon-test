@@ -117,3 +117,5 @@ class Handler(BaseHTTPRequestHandler):
 server = HTTPServer(("0.0.0.0", PORT), Handler)
 print(f"Glukolov network test listening on port {PORT}", flush=True)
 server.serve_forever()
+
+# network-test-v2
