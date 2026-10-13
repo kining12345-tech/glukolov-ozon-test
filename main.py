@@ -98,6 +98,18 @@ async def run_test():
 
         try:
             browser = await p.chromium.launch(
+    executable_path="/usr/bin/chromium",
+    headless=True,
+    proxy={
+        "server": f"http://{PROXY_HOST}:{PROXY_PORT}",
+        "username": PROXY_USER,
+        "password": PROXY_PASS,
+    },
+    args=[
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+    ],
+)
                 headless=True,
                 proxy={
                     "server": (
