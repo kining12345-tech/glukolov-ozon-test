@@ -1,7 +1,6 @@
 import os
 import json
 import asyncio
-from html import unescape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from playwright.async_api import async_playwright
@@ -45,20 +44,22 @@ async def inspect_page(page, url):
 
         result["page_length"] = len(text)
 
+        low = text.lower()
+
         result["markers"] = {
             "connection_error": (
-                "похоже, нет соединения" in text.lower()
+                "похоже, нет соединения" in low
             ),
             "captcha": (
-                "captcha" in text.lower()
-                or "капч" in text.lower()
+                "captcha" in low
+                or "капч" in low
             ),
             "robot_check": (
-                "подтвердите, что вы человек" in text.lower()
-                or "verify you are human" in text.lower()
+                "подтвердите, что вы человек" in low
+                or "verify you are human" in low
             ),
             "product_signals": any(
-                marker in text.lower()
+                marker in low
                 for marker in (
                     "добавить в корзину",
                     "купить",
@@ -77,6 +78,7 @@ async def inspect_page(page, url):
 
 
 async def run_test():
+
     if not all([
         PROXY_HOST,
         PROXY_PORT,
@@ -94,31 +96,20 @@ async def run_test():
     }
 
     async with async_playwright() as p:
+
         browser = None
 
         try:
             browser = await p.chromium.launch(
-    executable_path="/usr/bin/chromium",
-    headless=True,
-    proxy={
-        "server": f"http://{PROXY_HOST}:{PROXY_PORT}",
-        "username": PROXY_USER,
-        "password": PROXY_PASS,
-    },
-    args=[
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-    ],
-)
+                executable_path="/usr/bin/chromium",
                 headless=True,
                 proxy={
-                    "server": (
-                        f"http://{PROXY_HOST}:{PROXY_PORT}"
-                    ),
+                    "server": f"http://{PROXY_HOST}:{PROXY_PORT}",
                     "username": PROXY_USER,
                     "password": PROXY_PASS,
                 },
                 args=[
+                    "--no-sandbox",
                     "--disable-dev-shm-usage",
                 ],
             )
@@ -140,7 +131,11 @@ async def run_test():
             )
 
             home = output["ozon_home"]
-            markers = home.get("markers", {})
+
+            markers = home.get(
+                "markers",
+                {},
+            )
 
             if (
                 home.get("http_status") == 200
@@ -153,9 +148,7 @@ async def run_test():
             else:
                 output["ozon_category"] = {
                     "skipped": True,
-                    "reason": (
-                        "Homepage did not pass the initial check"
-                    ),
+                    "reason": "Homepage check failed",
                 }
 
             await context.close()
@@ -172,16 +165,25 @@ async def run_test():
 
 
 class Handler(BaseHTTPRequestHandler):
+
     def do_GET(self):
+
         if self.path == "/health":
+
             payload = {
                 "status": "ok",
                 "project": "Glukolov Chromium proxy test",
             }
+
         else:
+
             try:
-                payload = asyncio.run(run_test())
+                payload = asyncio.run(
+                    run_test()
+                )
+
             except Exception as e:
+
                 payload = {
                     "error": type(e).__name__,
                     "details": str(e)[:1500],
@@ -193,26 +195,34 @@ class Handler(BaseHTTPRequestHandler):
             indent=2,
         ).encode("utf-8")
 
+
         self.send_response(200)
+
         self.send_header(
             "Content-Type",
             "application/json; charset=utf-8",
         )
+
         self.send_header(
             "Content-Length",
             str(len(data)),
         )
+
         self.end_headers()
+
         self.wfile.write(data)
+
 
     def log_message(self, fmt, *args):
         print(fmt % args, flush=True)
+
 
 
 print(
     f"Glukolov Chromium proxy test listening on {PORT}",
     flush=True,
 )
+
 
 HTTPServer(
     ("0.0.0.0", PORT),
