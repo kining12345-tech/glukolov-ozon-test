@@ -18,29 +18,71 @@ STATE = {
 LOCK = threading.Lock()
 
 
+async def fetch_page(page, url, timeout=20000):
+
+    result = {
+        "url": url
+    }
+
+    try:
+
+        response = await page.goto(
+            url,
+            wait_until="commit",
+            timeout=timeout
+        )
+
+        await page.wait_for_timeout(2000)
+
+        try:
+            html = await page.content()
+        except:
+            html = ""
+
+        result.update({
+            "status": (
+                response.status
+                if response
+                else None
+            ),
+            "final_url": page.url,
+            "title": await page.title(),
+            "html_length": len(html),
+            "html_start": html[:500]
+        })
+
+
+    except Exception as e:
+
+        result["error"] = str(e)
+
+        try:
+            result["current_url"] = page.url
+        except:
+            pass
+
+
+    return result
+
+
+
 async def run_test():
 
     from playwright.async_api import async_playwright
 
+
     result = {
-        "project": "Glukolov Firefox hard timeout",
-        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "steps": []
+        "project": "Glukolov Firefox network comparison",
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
-    def log(x):
-        print(x, flush=True)
-        result["steps"].append(x)
 
     async with async_playwright() as p:
 
-        log("PLAYWRIGHT READY")
 
         browser = await p.firefox.launch(
             headless=True
         )
-
-        log("FIREFOX STARTED")
 
 
         context = await browser.new_context(
@@ -51,8 +93,8 @@ async def run_test():
             locale="ru-RU",
             timezone_id="Europe/Moscow",
             viewport={
-                "width": 412,
-                "height": 915
+                "width":412,
+                "height":915
             },
             has_touch=True
         )
@@ -60,135 +102,37 @@ async def run_test():
 
         page = await context.new_page()
 
-        log("PAGE CREATED")
+
+        result["tests"] = {}
 
 
-        failed_requests = []
+        print("TEST IPIFY", flush=True)
 
-        page.on(
-            "requestfailed",
-            lambda req: failed_requests.append({
-                "url": req.url,
-                "error": str(req.failure)
-            })
+        result["tests"]["ipify"] = await fetch_page(
+            page,
+            "https://api.ipify.org/?format=json"
         )
 
 
-        async def navigation():
+        print("TEST HTTPBIN", flush=True)
 
-            try:
-
-                response = await page.goto(
-                    "https://www.ozon.ru/",
-                    wait_until="commit",
-                    timeout=15000
-                )
-
-                return {
-                    "status": (
-                        response.status
-                        if response
-                        else None
-                    ),
-                    "result": "commit_ok"
-                }
-
-            except Exception as e:
-
-                return {
-                    "result": "error",
-                    "error": str(e)
-                }
-
-
-        task = asyncio.create_task(
-            navigation()
+        result["tests"]["httpbin"] = await fetch_page(
+            page,
+            "https://httpbin.org/get"
         )
 
 
-        await asyncio.sleep(20)
+        print("TEST OZON", flush=True)
 
-        log("20 SECOND CHECK")
-
-
-        try:
-            html = await page.content()
-        except Exception as e:
-            html = "CONTENT ERROR: " + str(e)
+        result["tests"]["ozon"] = await fetch_page(
+            page,
+            "https://www.ozon.ru/",
+            timeout=30000
+        )
 
 
-        try:
-            title = await page.title()
-        except Exception as e:
-            title = "TITLE ERROR: " + str(e)
-
-
-        result["ozon"] = {
-
-            "url": page.url,
-
-            "title": title,
-
-            "html_length": len(html),
-
-            "markers": {
-
-                "challenge":
-                    "challenge" in html.lower()
-                    or "abt-challenge" in html.lower(),
-
-                "antibot":
-                    "antibot" in html.lower(),
-
-                "connection_error":
-                    "нет соединения" in html.lower(),
-
-                "tilegrid":
-                    "tilegrid" in html.lower(),
-
-                "pricev2":
-                    "pricev2" in html.lower(),
-
-                "product":
-                    "product" in html.lower()
-                    or "товар" in html.lower()
-            },
-
-            "html_start": html[:2000],
-
-            "failed_requests": failed_requests[:20]
-        }
-
-
-        if task.done():
-
-            result["navigation_task"] = (
-                task.result()
-            )
-
-        else:
-
-            result["navigation_task"] = (
-                "still_running_after_20_seconds"
-            )
-
-
-        log("CLOSING BROWSER")
-
-
-        try:
-            await context.close()
-        except:
-            pass
-
-
-        try:
-            await browser.close()
-        except:
-            pass
-
-
-        log("DONE")
+        await context.close()
+        await browser.close()
 
 
     return result
@@ -229,6 +173,7 @@ def worker():
 
 class Handler(BaseHTTPRequestHandler):
 
+
     def send_json(self, data):
 
         body = json.dumps(
@@ -266,8 +211,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
 
             self.send_json({
-                "status": "ok",
-                "project": "Glukolov Firefox hard timeout"
+                "status":"ok",
+                "project":"Glukolov Firefox network comparison"
             })
 
 
@@ -289,14 +234,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
             self.send_json({
-                "status": "started"
+                "status":"started"
             })
 
 
         elif path == "/status":
 
             with LOCK:
-
                 self.send_json(
                     STATE
                 )
@@ -305,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
 
             self.send_json({
-                "routes": [
+                "routes":[
                     "/health",
                     "/test",
                     "/status"
@@ -323,7 +267,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 print(
-    f"Glukolov Firefox hard timeout listening {PORT}",
+    f"Glukolov Firefox network comparison listening {PORT}",
     flush=True
 )
 
