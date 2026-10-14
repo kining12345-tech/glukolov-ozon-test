@@ -23,24 +23,25 @@ async def run_test():
     from playwright.async_api import async_playwright
 
     result = {
-        "project": "Glukolov Firefox Ozon timeout debug",
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "project": "Glukolov Firefox hard timeout",
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "steps": []
     }
 
-    def step(x):
+    def log(x):
         print(x, flush=True)
         result["steps"].append(x)
 
     async with async_playwright() as p:
 
-        step("PLAYWRIGHT READY")
+        log("PLAYWRIGHT READY")
 
         browser = await p.firefox.launch(
             headless=True
         )
 
-        step("FIREFOX READY")
+        log("FIREFOX STARTED")
+
 
         context = await browser.new_context(
             user_agent=(
@@ -56,62 +57,91 @@ async def run_test():
             has_touch=True
         )
 
+
         page = await context.new_page()
 
-        failed = []
+        log("PAGE CREATED")
+
+
+        failed_requests = []
 
         page.on(
             "requestfailed",
-            lambda req: failed.append({
+            lambda req: failed_requests.append({
                 "url": req.url,
                 "error": str(req.failure)
             })
         )
 
-        step("OPEN OZON")
 
-        try:
-            await page.goto(
-                "https://www.ozon.ru/",
-                wait_until="commit",
-                timeout=25000
-            )
+        async def navigation():
 
-            navigation = "commit_ok"
+            try:
 
-        except Exception as e:
-            navigation = str(e)
+                response = await page.goto(
+                    "https://www.ozon.ru/",
+                    wait_until="commit",
+                    timeout=15000
+                )
 
-        step("NAVIGATION FINISHED")
+                return {
+                    "status": (
+                        response.status
+                        if response
+                        else None
+                    ),
+                    "result": "commit_ok"
+                }
 
-        await page.wait_for_timeout(3000)
+            except Exception as e:
+
+                return {
+                    "result": "error",
+                    "error": str(e)
+                }
+
+
+        task = asyncio.create_task(
+            navigation()
+        )
+
+
+        await asyncio.sleep(20)
+
+        log("20 SECOND CHECK")
+
 
         try:
             html = await page.content()
-        except Exception:
-            html = ""
+        except Exception as e:
+            html = "CONTENT ERROR: " + str(e)
+
 
         try:
             title = await page.title()
-        except Exception:
-            title = ""
+        except Exception as e:
+            title = "TITLE ERROR: " + str(e)
+
 
         result["ozon"] = {
-            "navigation": navigation,
+
             "url": page.url,
+
             "title": title,
+
             "html_length": len(html),
 
             "markers": {
+
                 "challenge":
                     "challenge" in html.lower()
                     or "abt-challenge" in html.lower(),
 
-                "connection_error":
-                    "нет соединения" in html.lower(),
-
                 "antibot":
                     "antibot" in html.lower(),
+
+                "connection_error":
+                    "нет соединения" in html.lower(),
 
                 "tilegrid":
                     "tilegrid" in html.lower(),
@@ -124,40 +154,77 @@ async def run_test():
                     or "товар" in html.lower()
             },
 
-            "failed_requests": failed[:20],
-            "html_start": html[:2000]
+            "html_start": html[:2000],
+
+            "failed_requests": failed_requests[:20]
         }
 
-        await context.close()
-        await browser.close()
 
-        step("DONE")
+        if task.done():
+
+            result["navigation_task"] = (
+                task.result()
+            )
+
+        else:
+
+            result["navigation_task"] = (
+                "still_running_after_20_seconds"
+            )
+
+
+        log("CLOSING BROWSER")
+
+
+        try:
+            await context.close()
+        except:
+            pass
+
+
+        try:
+            await browser.close()
+        except:
+            pass
+
+
+        log("DONE")
+
 
     return result
+
 
 
 def worker():
 
     try:
-        result = asyncio.run(run_test())
+
+        res = asyncio.run(
+            run_test()
+        )
 
         with LOCK:
-            STATE["result"] = result
+
+            STATE["result"] = res
             STATE["last_error"] = None
+
 
     except Exception as e:
 
         with LOCK:
+
             STATE["last_error"] = {
                 "type": type(e).__name__,
                 "message": str(e),
                 "traceback": traceback.format_exc()
             }
 
+
     finally:
 
         with LOCK:
             STATE["running"] = False
+
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -170,30 +237,39 @@ class Handler(BaseHTTPRequestHandler):
             indent=2
         ).encode()
 
+
         self.send_response(200)
+
         self.send_header(
             "Content-Type",
             "application/json; charset=utf-8"
         )
+
         self.send_header(
             "Content-Length",
             str(len(body))
         )
+
         self.end_headers()
 
         self.wfile.write(body)
 
 
+
     def do_GET(self):
 
-        path = urlparse(self.path).path
+        path = urlparse(
+            self.path
+        ).path
+
 
         if path == "/health":
 
             self.send_json({
                 "status": "ok",
-                "project": "Glukolov Firefox test"
+                "project": "Glukolov Firefox hard timeout"
             })
+
 
         elif path == "/test":
 
@@ -205,19 +281,26 @@ class Handler(BaseHTTPRequestHandler):
                     STATE["result"] = None
                     STATE["last_error"] = None
 
+
                     threading.Thread(
                         target=worker,
                         daemon=True
                     ).start()
 
+
             self.send_json({
                 "status": "started"
             })
 
+
         elif path == "/status":
 
             with LOCK:
-                self.send_json(STATE)
+
+                self.send_json(
+                    STATE
+                )
+
 
         else:
 
@@ -230,14 +313,20 @@ class Handler(BaseHTTPRequestHandler):
             })
 
 
+
     def log_message(self, fmt, *args):
-        print(fmt % args, flush=True)
+        print(
+            fmt % args,
+            flush=True
+        )
+
 
 
 print(
-    f"Glukolov Firefox test listening {PORT}",
+    f"Glukolov Firefox hard timeout listening {PORT}",
     flush=True
 )
+
 
 server = ThreadingHTTPServer(
     ("0.0.0.0", PORT),
