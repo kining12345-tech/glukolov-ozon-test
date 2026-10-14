@@ -1,11 +1,12 @@
 import os
+import re
 import json
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote
 
-import requests
+from playwright.sync_api import sync_playwright
 
 
 PORT = int(os.environ.get("PORT", "8000"))
@@ -23,142 +24,266 @@ state = {
 
 lock = threading.Lock()
 
-USER_AGENT = (
-    "Mozilla/5.0 (Android 13; Mobile; rv:157.0) "
-    "Gecko/157.0 Firefox/157.0"
-)
-
 TESTS = {
     "ipify": "https://api.ipify.org/?format=json",
     "httpbin": "https://httpbin.org/get",
     "ozon": "https://www.ozon.ru/",
 }
 
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
 
-def build_proxy_url():
-    if not PROXY_HOST or not PROXY_PORT:
+
+def redact(text):
+    """Удаляет токены из диагностического текста."""
+    text = re.sub(
+        r'(?i)("token"\s*:\s*")[^"]*(")',
+        r'\1[REDACTED]\2',
+        text,
+    )
+    text = re.sub(
+        r'(?i)(token=)[^&"\s]+',
+        r'\1[REDACTED]',
+        text,
+    )
+    text = re.sub(
+        r'(?i)(authorization:\s*bearer\s+)[^\s]+',
+        r'\1[REDACTED]',
+        text,
+    )
+    return text
+
+
+def check_proxy_config():
+    missing = []
+
+    for name, value in (
+        ("PROXY_HOST", PROXY_HOST),
+        ("PROXY_PORT", PROXY_PORT),
+        ("PROXY_USER", PROXY_USER),
+        ("PROXY_PASS", PROXY_PASS),
+    ):
+        if not value:
+            missing.append(name)
+
+    if missing:
         raise RuntimeError(
-            "Не заданы PROXY_HOST или PROXY_PORT в переменных Hostless"
+            "Не заданы переменные прокси: " + ", ".join(missing)
         )
-
-    if not PROXY_USER or not PROXY_PASS:
-        raise RuntimeError(
-            "Не заданы PROXY_USER или PROXY_PASS в переменных Hostless"
-        )
-
-    user = quote(PROXY_USER, safe="")
-    password = quote(PROXY_PASS, safe="")
-
-    return f"http://{user}:{password}@{PROXY_HOST}:{PROXY_PORT}"
 
 
 def run_tests():
-    started = datetime.now(timezone.utc).isoformat()
-
     result = {
-        "project": "Glukolov Ozon Russian proxy test",
-        "started_at": started,
+        "project": "Glukolov Chromium Russian proxy test",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "browser": "Chromium",
         "proxy_configured": False,
         "tests": {},
+        "steps": [],
     }
 
+    browser = None
+
     try:
-        proxy_url = build_proxy_url()
-
-        # Не записываем proxy_url в результат: в нём есть учётные данные.
-        proxies = {
-            "http": proxy_url,
-            "https": proxy_url,
-        }
-
+        check_proxy_config()
         result["proxy_configured"] = True
+        result["steps"].append("PROXY_CONFIG_OK")
 
-        session = requests.Session()
-        session.trust_env = False
-        session.proxies.update(proxies)
-        session.headers.update({
-            "User-Agent": USER_AGENT,
-            "Accept": (
-                "text/html,application/xhtml+xml,application/json,"
-                "application/xml;q=0.9,*/*;q=0.8"
-            ),
-            "Accept-Language": "ru-RU",
-        })
+        with sync_playwright() as p:
+            result["steps"].append("PLAYWRIGHT_READY")
 
-        for name, url in TESTS.items():
-            item = {
-                "url": url,
-                "through_proxy": True,
-            }
+            browser = p.chromium.launch(
+                headless=True,
+                proxy={
+                    "server": f"http://{PROXY_HOST}:{PROXY_PORT}",
+                    "username": PROXY_USER,
+                    "password": PROXY_PASS,
+                },
+                timeout=30000,
+            )
 
-            try:
-                response = session.get(
-                    url,
-                    timeout=(15, 30),
-                    allow_redirects=True,
-                )
+            result["steps"].append("CHROMIUM_STARTED")
 
-                body = response.text
-                lower = body.lower()
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                locale="ru-RU",
+                viewport={"width": 1365, "height": 900},
+                ignore_https_errors=False,
+            )
 
-                item.update({
-                    "status": response.status_code,
-                    "final_url": response.url,
-                    "content_type": response.headers.get(
-                        "Content-Type", ""
-                    ),
-                    "length": len(response.content),
-                    "markers": {
-                        "challenge": (
-                            "challenge" in lower
-                            or "проверяем, что вы не робот" in lower
-                        ),
-                        "antibot": (
-                            "antibot" in lower
-                            or "anti-bot" in lower
-                        ),
-                        "connection_error": (
-                            "похоже, нет соединения" in lower
-                            or "connection_error" in lower
-                        ),
-                        "product": (
-                            "tilegrid" in lower
-                            or "pricev2" in lower
-                            or "product-card" in lower
-                        ),
-                    },
-                    "body_start": body[:1200],
-                })
+            page = context.new_page()
+            page.set_default_navigation_timeout(30000)
+            page.set_default_timeout(10000)
 
-                if name == "ipify":
+            for name, url in TESTS.items():
+                item = {
+                    "url": url,
+                    "browser": "Chromium",
+                    "through_proxy": True,
+                }
+
+                response_status = None
+                failed_requests = []
+
+                def on_response(response):
+                    nonlocal response_status
+
+                    if response.request.is_navigation_request():
+                        if response.url == url or name == "ozon":
+                            response_status = response.status
+
+                def on_failed_request(request):
+                    if len(failed_requests) < 10:
+                        failed_requests.append({
+                            "url": redact(request.url[:300]),
+                            "failure": redact(
+                                str(request.failure or "")[:300]
+                            ),
+                        })
+
+                page.on("response", on_response)
+                page.on("requestfailed", on_failed_request)
+
+                try:
+                    response = page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+
+                    if response is not None:
+                        response_status = response.status
+
+                    # Даем странице короткое время на первичную отрисовку.
+                    page.wait_for_timeout(1500)
+
+                    current_url = page.url
+                    title = page.title()
+
                     try:
-                        item["observed_ip"] = response.json().get("ip")
+                        body = page.locator("body").inner_text(
+                            timeout=5000
+                        )
                     except Exception:
-                        item["observed_ip"] = None
+                        body = ""
 
-                if name == "httpbin":
                     try:
-                        data = response.json()
-                        item["httpbin_origin"] = data.get("origin")
+                        html = page.content()
                     except Exception:
-                        item["httpbin_origin"] = None
+                        html = ""
 
-            except Exception as exc:
-                # Не включаем URL прокси или его учётные данные в ошибки.
-                item["error_type"] = type(exc).__name__
-                item["error"] = str(exc)[:500]
+                    combined = (html + "\n" + body).lower()
 
-            result["tests"][name] = item
+                    item.update({
+                        "status": response_status,
+                        "final_url": redact(current_url[:1000]),
+                        "title": redact(title[:300]),
+                        "html_length": len(html),
+                        "body_length": len(body),
+                        "markers": {
+                            "challenge": (
+                                "challenge" in combined
+                                or "проверяем, что вы не робот" in combined
+                            ),
+                            "antibot": (
+                                "antibot" in combined
+                                or "anti-bot" in combined
+                                or "antibot challenge" in combined
+                            ),
+                            "block_page": (
+                                "block.html" in combined
+                                or "incidentid" in combined
+                            ),
+                            "connection_error": (
+                                "похоже, нет соединения" in combined
+                                or "connection_error" in combined
+                            ),
+                            "product_data": (
+                                "tilegrid" in combined
+                                or "pricev2" in combined
+                            ),
+                            "product_cards": (
+                                "product-card" in combined
+                                or "widget-search-result-container" in combined
+                            ),
+                        },
+                        "body_start": redact(body[:1000]),
+                        "html_start": redact(html[:1000]),
+                    })
 
-        session.close()
+                    if name == "ipify":
+                        match = re.search(
+                            r'"ip"\s*:\s*"([^"]+)"',
+                            body,
+                        )
+                        item["observed_ip"] = (
+                            match.group(1) if match else None
+                        )
+
+                    if name == "httpbin":
+                        match = re.search(
+                            r'"origin"\s*:\s*"([^"]+)"',
+                            body,
+                        )
+                        item["httpbin_origin"] = (
+                            match.group(1) if match else None
+                        )
+
+                except Exception as exc:
+                    item.update({
+                        "status": response_status,
+                        "error_type": type(exc).__name__,
+                        "error": redact(str(exc)[:700]),
+                        "current_url": redact(page.url[:1000]),
+                    })
+
+                finally:
+                    page.remove_listener("response", on_response)
+                    page.remove_listener(
+                        "requestfailed", on_failed_request
+                    )
+
+                if failed_requests:
+                    item["failed_requests"] = failed_requests
+
+                result["tests"][name] = item
+                result["steps"].append(f"TEST_{name.upper()}_DONE")
+
+                # После ответа Ozon не выполняем дополнительные запросы к нему.
+                # Переходим только к следующей независимой проверке.
+
+            context.close()
+            browser.close()
+            browser = None
+
+            result["steps"].append("BROWSER_CLOSED")
+            result["completed_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
 
     except Exception as exc:
-        result["configuration_error"] = type(exc).__name__
-        result["message"] = str(exc)[:500]
+        result["fatal_error"] = {
+            "type": type(exc).__name__,
+            "message": redact(str(exc)[:1000]),
+        }
 
-    with lock:
-        state["result"] = result
-        state["running"] = False
+        result["completed_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    finally:
+        with lock:
+            state["result"] = result
+            state["running"] = False
 
 
 def start_test():
@@ -169,8 +294,7 @@ def start_test():
         state["running"] = True
         state["last_error"] = None
 
-    thread = threading.Thread(target=run_tests, daemon=True)
-    thread.start()
+    threading.Thread(target=run_tests, daemon=True).start()
     return True
 
 
@@ -183,7 +307,10 @@ class Handler(BaseHTTPRequestHandler):
         ).encode("utf-8")
 
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8",
+        )
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -195,7 +322,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("", "/health"):
             self.send_json({
                 "ok": True,
-                "project": "Glukolov Ozon Russian proxy test",
+                "project": "Glukolov Chromium Russian proxy test",
                 "proxy_variables_present": {
                     "PROXY_HOST": bool(PROXY_HOST),
                     "PROXY_PORT": bool(PROXY_PORT),
@@ -209,15 +336,13 @@ class Handler(BaseHTTPRequestHandler):
             started = start_test()
 
             with lock:
-                current = state["running"]
+                running = state["running"]
 
             self.send_json({
                 "accepted": started,
-                "running": current,
+                "running": running,
                 "message": (
-                    "Тест запущен. Откройте /status через несколько секунд."
-                    if started
-                    else "Тест уже выполняется."
+                    "Тест запущен. Проверьте /status через 10–15 секунд."
                 ),
                 "status_url": "/status",
             }, 202)
@@ -240,14 +365,17 @@ class Handler(BaseHTTPRequestHandler):
         }, 404)
 
     def log_message(self, fmt, *args):
-        # Не записываем заголовки запросов и другие потенциальные секреты.
         print(
-            f"{self.client_address[0]} - {self.log_date_time_string()} "
-            f"{fmt % args}"
+            f"{self.client_address[0]} "
+            f"{self.log_date_time_string()} {fmt % args}",
+            flush=True,
         )
 
 
 if __name__ == "__main__":
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"Glukolov proxy test listening on port {PORT}", flush=True)
+    print(
+        f"Glukolov Chromium proxy test listening on port {PORT}",
+        flush=True,
+    )
     server.serve_forever()
