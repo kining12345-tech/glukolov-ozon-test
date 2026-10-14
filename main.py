@@ -16,7 +16,8 @@ PROXY_PORT = os.environ.get("PROXY_PORT", "")
 PROXY_USER = os.environ.get("PROXY_USER", "")
 PROXY_PASS = os.environ.get("PROXY_PASS", "")
 
-RESULT_FILE = "/tmp/glukolov_result.json"
+PROFILE_DIR = "/tmp/glukolov-chrome-profile"
+RESULT_FILE = "/tmp/result.json"
 
 
 def now():
@@ -26,7 +27,7 @@ def now():
     )
 
 
-def save_result(data):
+def save(data):
     with open(
         RESULT_FILE,
         "w",
@@ -40,77 +41,63 @@ def save_result(data):
         )
 
 
-def load_result():
+def load():
     if not os.path.exists(RESULT_FILE):
         return {
-            "status": "idle",
-            "started_at": None,
-            "finished_at": None,
-            "result": None
+            "status": "idle"
         }
 
     with open(
         RESULT_FILE,
-        "r",
         encoding="utf-8"
     ) as f:
         return json.load(f)
 
 
 
-async def check_page(page, url):
+async def inspect(page):
 
-    print("OPEN:", url, flush=True)
+    print(
+        "OPEN OZON",
+        flush=True
+    )
 
-    result = {
-        "requested_url": url
-    }
+    result = {}
 
     try:
 
         response = await page.goto(
-            url,
-            wait_until="commit",
-            timeout=20000
+            "https://www.ozon.ru/",
+            wait_until="domcontentloaded",
+            timeout=30000
         )
 
 
         print(
-            "PAGE COMMITTED",
+            "PAGE LOADED",
             flush=True
         )
 
 
-        result["http_status"] = (
+        result["status"] = (
             response.status
             if response
             else None
         )
 
-
-        result["final_url"] = page.url
-
-
-        await page.wait_for_timeout(5000)
+        result["url"] = page.url
 
 
-        print(
-            "READING HTML",
-            flush=True
-        )
+        await page.wait_for_timeout(8000)
 
 
         html = await page.content()
 
 
-        print(
-            "HTML RECEIVED:",
-            len(html),
-            flush=True
-        )
-
-
         result["html_length"] = len(html)
+
+
+        result["cookies"] = await page.context.cookies()
 
 
         low = html.lower()
@@ -118,16 +105,12 @@ async def check_page(page, url):
 
         result["markers"] = {
 
-            "connection_error":
-                "похоже, нет соединения" in low,
+            "antibot":
+                "antibot challenge" in low,
 
-            "captcha":
-                "captcha" in low
-                or "капч" in low,
-
-            "robot_check":
-                "verify" in low
-                or "человек" in low,
+            "robot":
+                "не робот" in low
+                or "robot" in low,
 
             "tilegrid":
                 "tilegrid2" in low,
@@ -136,52 +119,57 @@ async def check_page(page, url):
                 "pricev2" in low,
 
             "product":
-                "/product/" in low
+                "/product/" in low,
+
+            "ozon_main":
+                "ozon" in low
+
         }
 
 
-        result["html_start"] = html[:1000]
+        result["html_start"] = html[:1500]
+
+
+        print(
+            "HTML:",
+            len(html),
+            flush=True
+        )
 
 
     except Exception as e:
 
-        print(
-            "PAGE ERROR:",
-            e,
-            flush=True
-        )
-
-        result["error"] = type(e).__name__
-        result["details"] = str(e)[:2000]
+        result["error"] = str(e)
 
 
     return result
 
 
 
-async def browser_test():
+async def run_browser():
 
     print(
         "CHROMIUM START",
         flush=True
     )
 
-
     output = {
         "project":
-            "Glukolov Chromium proxy test"
+            "Glukolov persistent Chromium test"
     }
 
 
     async with async_playwright() as p:
 
+
         browser = None
-        context = None
 
 
         try:
 
-            browser = await p.chromium.launch(
+            browser = await p.chromium.launch_persistent_context(
+
+                user_data_dir=PROFILE_DIR,
 
                 executable_path="/usr/bin/chromium",
 
@@ -200,11 +188,30 @@ async def browser_test():
 
                 },
 
+                viewport={
+                    "width":1365,
+                    "height":900
+                },
+
+                locale="ru-RU",
+
+                timezone_id="Europe/Moscow",
+
+                user_agent=(
+
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+
+                ),
+
                 args=[
 
                     "--no-sandbox",
 
-                    "--disable-dev-shm-usage"
+                    "--disable-blink-features=AutomationControlled"
 
                 ]
 
@@ -212,72 +219,68 @@ async def browser_test():
 
 
             print(
-                "CHROMIUM READY",
+                "PROFILE READY",
                 flush=True
             )
 
 
-            context = await browser.new_context(
+            await browser.add_init_script(
 
-                user_agent=(
-                    "Mozilla/5.0 "
-                    "(Linux; Android 13) "
-                    "AppleWebKit/537.36 "
-                    "Chrome/130 Mobile"
-                ),
+                """
 
-                viewport={
-                    "width":412,
-                    "height":915
-                },
+                Object.defineProperty(
+                    navigator,
+                    'webdriver',
+                    {
+                        get: () => undefined
+                    }
+                );
 
-                locale="ru-RU",
 
-                timezone_id="Europe/Moscow",
+                Object.defineProperty(
+                    navigator,
+                    'languages',
+                    {
+                        get: () => ['ru-RU','ru']
+                    }
+                );
 
-                is_mobile=True,
 
-                has_touch=True
+                Object.defineProperty(
+                    navigator,
+                    'platform',
+                    {
+                        get: () => 'Win32'
+                    }
+                );
 
+                """
+
+            )
+
+
+            page = (
+                browser.pages[0]
+                if browser.pages
+                else await browser.new_page()
             )
 
 
-            page = await context.new_page()
+            output["ozon"] = await inspect(page)
 
-
-            print(
-                "OZON TEST",
-                flush=True
-            )
-
-
-            output["ozon"] = await check_page(
-
-                page,
-
-                "https://www.ozon.ru/"
-
-            )
 
 
         except Exception as e:
 
-
             output["error"] = type(e).__name__
-
-            output["details"] = str(e)[:2000]
+            output["details"] = str(e)
 
 
         finally:
 
-            if context:
-
-                await context.close()
-
             if browser:
 
                 await browser.close()
-
 
 
     print(
@@ -292,55 +295,31 @@ async def browser_test():
 
 def worker():
 
-    try:
+    save({
 
-        save_result({
+        "status":"running",
 
-            "status": "running",
+        "started_at":now(),
 
-            "started_at": now(),
+        "result":None
 
-            "finished_at": None,
-
-            "result": None
-
-        })
+    })
 
 
-        result = asyncio.run(
-            browser_test()
-        )
+    result = asyncio.run(
+        run_browser()
+    )
 
 
-        save_result({
+    save({
 
-            "status": "completed",
+        "status":"completed",
 
-            "started_at": None,
+        "finished_at":now(),
 
-            "finished_at": now(),
+        "result":result
 
-            "result": result
-
-        })
-
-
-    except Exception as e:
-
-
-        save_result({
-
-            "status": "failed",
-
-            "finished_at": now(),
-
-            "result": {
-
-                "error": str(e)
-
-            }
-
-        })
+    })
 
 
 
@@ -348,9 +327,9 @@ def worker():
 class Handler(BaseHTTPRequestHandler):
 
 
-    def send_json(self, data):
+    def send(self,data):
 
-        raw = json.dumps(
+        raw=json.dumps(
             data,
             ensure_ascii=False,
             indent=2
@@ -380,19 +359,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
-        path = urlparse(
+        path=urlparse(
             self.path
         ).path
 
 
-        if path == "/health":
+        if path=="/health":
 
-            return self.send_json({
+            return self.send({
                 "status":"ok"
             })
 
 
-        if path == "/test":
+        if path=="/test":
 
             threading.Thread(
                 target=worker,
@@ -400,46 +379,35 @@ class Handler(BaseHTTPRequestHandler):
             ).start()
 
 
-            return self.send_json({
-
-                "status":
-                    "started"
-
+            return self.send({
+                "status":"started"
             })
 
 
-        if path == "/status":
+        if path=="/status":
 
-            return self.send_json(
-                load_result()
+            return self.send(
+                load()
             )
 
 
-        return self.send_json({
-
-            "error":
-                "404"
-
+        return self.send({
+            "error":"404"
         })
 
 
-
-    def log_message(self, fmt, *args):
-
-        print(
-            fmt % args,
-            flush=True
-        )
+    def log_message(self,*args):
+        pass
 
 
 
 print(
-    f"Glukolov Chromium proxy test listening on {PORT}",
+    f"Glukolov persistent Chromium test listening on {PORT}",
     flush=True
 )
 
 
 HTTPServer(
-    ("0.0.0.0", PORT),
+    ("0.0.0.0",PORT),
     Handler
 ).serve_forever()
