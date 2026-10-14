@@ -57,6 +57,7 @@ def load_result():
         return json.load(f)
 
 
+
 async def check_page(page, url):
 
     print("OPEN:", url, flush=True)
@@ -73,16 +74,19 @@ async def check_page(page, url):
             timeout=20000
         )
 
+
         print(
             "PAGE COMMITTED",
             flush=True
         )
+
 
         result["http_status"] = (
             response.status
             if response
             else None
         )
+
 
         result["final_url"] = page.url
 
@@ -91,27 +95,25 @@ async def check_page(page, url):
 
 
         print(
-            "READING BODY",
+            "READING HTML",
             flush=True
         )
 
 
-        result["title"] = await page.title()
+        html = await page.content()
 
 
-        text = await page.locator(
-            "body"
-        ).inner_text(
-            timeout=10000
+        print(
+            "HTML RECEIVED:",
+            len(html),
+            flush=True
         )
 
 
-        result["visible_text"] = (
-            " ".join(text.split())
-        )[:3000]
+        result["html_length"] = len(html)
 
 
-        low = text.lower()
+        low = html.lower()
 
 
         result["markers"] = {
@@ -127,17 +129,18 @@ async def check_page(page, url):
                 "verify" in low
                 or "человек" in low,
 
-            "products":
-                any(
-                    x in low
-                    for x in [
-                        "купить",
-                        "корзина",
-                        "отзывы",
-                        "рейтинг"
-                    ]
-                )
+            "tilegrid":
+                "tilegrid2" in low,
+
+            "pricev2":
+                "pricev2" in low,
+
+            "product":
+                "/product/" in low
         }
+
+
+        result["html_start"] = html[:1000]
 
 
     except Exception as e:
@@ -166,26 +169,8 @@ async def browser_test():
 
     output = {
         "project":
-            "Glukolov Chromium proxy test",
-
-        "proxy":
-            f"{PROXY_HOST}:{PROXY_PORT}"
+            "Glukolov Chromium proxy test"
     }
-
-
-    if not all([
-        PROXY_HOST,
-        PROXY_PORT,
-        PROXY_USER,
-        PROXY_PASS
-    ]):
-
-        output["error"] = (
-            "Proxy environment variables missing"
-        )
-
-        return output
-
 
 
     async with async_playwright() as p:
@@ -195,7 +180,6 @@ async def browser_test():
 
 
         try:
-
 
             browser = await p.chromium.launch(
 
@@ -213,16 +197,17 @@ async def browser_test():
 
                     "password":
                         PROXY_PASS
+
                 },
 
                 args=[
 
                     "--no-sandbox",
 
-                    "--disable-dev-shm-usage",
+                    "--disable-dev-shm-usage"
 
-                    "--disable-gpu"
                 ]
+
             )
 
 
@@ -232,14 +217,11 @@ async def browser_test():
             )
 
 
-
             context = await browser.new_context(
 
                 user_agent=(
-
                     "Mozilla/5.0 "
-                    "(Linux; Android 13; "
-                    "Mobile) "
+                    "(Linux; Android 13) "
                     "AppleWebKit/537.36 "
                     "Chrome/130 Mobile"
                 ),
@@ -256,35 +238,11 @@ async def browser_test():
                 is_mobile=True,
 
                 has_touch=True
-            )
-
-
-
-            # блокируем лишнее
-
-            await context.route(
-
-                "**/*",
-
-                lambda route:
-
-                route.abort()
-
-                if route.request.resource_type
-                in [
-                    "image",
-                    "font",
-                    "media"
-                ]
-
-                else route.continue_()
 
             )
-
 
 
             page = await context.new_page()
-
 
 
             print(
@@ -298,32 +256,11 @@ async def browser_test():
                 page,
 
                 "https://www.ozon.ru/"
+
             )
-
-
-
-            if output["ozon"].get(
-                "http_status"
-            ) == 200:
-
-
-                output["category"] = await check_page(
-
-                    page,
-
-                    "https://www.ozon.ru/category/zhenskaya-odezhda-7501/"
-                )
-
 
 
         except Exception as e:
-
-
-            print(
-                "BROWSER ERROR:",
-                e,
-                flush=True
-            )
 
 
             output["error"] = type(e).__name__
@@ -331,27 +268,15 @@ async def browser_test():
             output["details"] = str(e)[:2000]
 
 
-
         finally:
-
 
             if context:
 
-                try:
-                    await context.close()
-
-                except:
-                    pass
-
-
+                await context.close()
 
             if browser:
 
-                try:
-                    await browser.close()
-
-                except:
-                    pass
+                await browser.close()
 
 
 
@@ -369,6 +294,18 @@ def worker():
 
     try:
 
+        save_result({
+
+            "status": "running",
+
+            "started_at": now(),
+
+            "finished_at": None,
+
+            "result": None
+
+        })
+
 
         result = asyncio.run(
             browser_test()
@@ -377,16 +314,15 @@ def worker():
 
         save_result({
 
-            "status":
-                "completed",
+            "status": "completed",
 
-            "finished_at":
-                now(),
+            "started_at": None,
 
-            "result":
-                result
+            "finished_at": now(),
+
+            "result": result
+
         })
-
 
 
     except Exception as e:
@@ -394,16 +330,13 @@ def worker():
 
         save_result({
 
-            "status":
-                "failed",
+            "status": "failed",
 
-            "finished_at":
-                now(),
+            "finished_at": now(),
 
             "result": {
 
-                "error":
-                    str(e)
+                "error": str(e)
 
             }
 
@@ -418,20 +351,17 @@ class Handler(BaseHTTPRequestHandler):
     def send_json(self, data):
 
         raw = json.dumps(
-
             data,
-
             ensure_ascii=False,
-
             indent=2
+        ).encode()
 
-        ).encode("utf-8")
 
         self.send_response(200)
 
         self.send_header(
             "Content-Type",
-            "application/json; charset=utf-8"
+            "application/json"
         )
 
         self.send_header(
@@ -441,13 +371,9 @@ class Handler(BaseHTTPRequestHandler):
 
         self.end_headers()
 
-
         try:
-
             self.wfile.write(raw)
-
         except:
-
             pass
 
 
@@ -459,66 +385,19 @@ class Handler(BaseHTTPRequestHandler):
         ).path
 
 
-
         if path == "/health":
 
             return self.send_json({
-
-                "status":
-                    "ok"
-
+                "status":"ok"
             })
-
-
-
-        if path == "/":
-
-
-            return self.send_json({
-
-                "project":
-                    "Glukolov Chromium proxy test",
-
-                "routes":[
-
-                    "/test",
-
-                    "/status"
-
-                ]
-
-            })
-
 
 
         if path == "/test":
 
-
-            save_result({
-
-                "status":
-                    "running",
-
-                "started_at":
-                    now(),
-
-                "finished_at":
-                    None,
-
-                "result":
-                    None
-
-            })
-
-
             threading.Thread(
-
                 target=worker,
-
                 daemon=True
-
             ).start()
-
 
 
             return self.send_json({
@@ -529,16 +408,11 @@ class Handler(BaseHTTPRequestHandler):
             })
 
 
-
         if path == "/status":
 
-
             return self.send_json(
-
                 load_result()
-
             )
-
 
 
         return self.send_json({
@@ -550,11 +424,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 
-    def log_message(
-        self,
-        fmt,
-        *args
-    ):
+    def log_message(self, fmt, *args):
 
         print(
             fmt % args,
@@ -564,18 +434,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 print(
-
     f"Glukolov Chromium proxy test listening on {PORT}",
-
     flush=True
-
 )
 
 
 HTTPServer(
-
     ("0.0.0.0", PORT),
-
     Handler
-
 ).serve_forever()
