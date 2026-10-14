@@ -97,16 +97,15 @@ async def run_test():
 
         try:
             context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Android 13; Mobile; rv:157.0) "
-                    "Gecko/157.0 Firefox/157.0"
-                ),
-                locale="ru-RU",
-                timezone_id="Europe/Moscow",
-                viewport={"width": 412, "height": 915},
-                is_mobile=True,
-                has_touch=True,
-            )
+    user_agent=(
+        "Mozilla/5.0 (Android 13; Mobile; rv:157.0) "
+        "Gecko/157.0 Firefox/157.0"
+    ),
+    locale="ru-RU",
+    timezone_id="Europe/Moscow",
+    viewport={"width": 412, "height": 915},
+    has_touch=True,
+)
 
             page = await context.new_page()
             log("STEP 4: opening Ozon")
