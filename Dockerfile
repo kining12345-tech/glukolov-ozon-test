@@ -6,7 +6,9 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN python -m playwright install firefox
+RUN python -m playwright install --with-deps firefox
+
+RUN ls -la /root/.cache/ms-playwright || true
 
 COPY main.py .
 
