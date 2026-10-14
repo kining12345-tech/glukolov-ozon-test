@@ -1,16 +1,14 @@
 import os
-import sys
 import json
-import glob
 import time
 import asyncio
 import threading
 import traceback
-import subprocess
+import glob
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-PORT = int(os.environ.get("PORT", "8000"))
+PORT = int(os.environ.get("PORT", "8080"))
 
 STATE = {
     "running": False,
@@ -22,135 +20,183 @@ LOCK = threading.Lock()
 
 
 def browser_diagnostics():
-    import playwright
-
     home = os.path.expanduser("~")
-    cache = os.environ.get(
-        "PLAYWRIGHT_BROWSERS_PATH",
-        os.path.join(home, ".cache", "ms-playwright")
-    )
-
-    candidates = []
-    for pattern in [
-        os.path.join(cache, "firefox-*"),
-        os.path.join(cache, "firefox-*", "firefox", "firefox"),
-        "/usr/bin/firefox",
-        "/usr/bin/firefox-esr",
-    ]:
-        candidates.extend(glob.glob(pattern))
+    cache = os.path.join(home, ".cache", "ms-playwright")
 
     return {
-        "python": sys.version,
-        "executable": sys.executable,
-        "working_directory": os.getcwd(),
         "home": home,
-        "playwright_version": getattr(playwright, "__version__", "unknown"),
-        "PLAYWRIGHT_BROWSERS_PATH": os.environ.get(
-            "PLAYWRIGHT_BROWSERS_PATH"
-        ),
         "browser_cache": cache,
         "browser_cache_exists": os.path.exists(cache),
         "browser_cache_contents": (
-            os.listdir(cache) if os.path.isdir(cache) else []
+            os.listdir(cache)
+            if os.path.exists(cache)
+            else []
         ),
-        "firefox_candidates": candidates,
-        "firefox_executable_exists": os.path.exists(
-            os.path.join(cache, "firefox-1490", "firefox", "firefox")
+        "firefox_candidates": glob.glob(
+            os.path.join(cache, "firefox-*", "**", "firefox"),
+            recursive=True
         ),
     }
 
 
 async def run_test():
+
     from playwright.async_api import async_playwright
 
     result = {
+        "project": "Glukolov Firefox Ozon commit test",
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "diagnostics": browser_diagnostics(),
-        "steps": [],
+        "steps": []
     }
 
-    def log(message):
-        print(message, flush=True)
-        result["steps"].append(message)
-
-    log("STEP 1: diagnostics collected")
+    def step(text):
+        print(text, flush=True)
+        result["steps"].append(text)
 
     async with async_playwright() as p:
-        log("STEP 2: Playwright initialized")
 
-        browser = await asyncio.wait_for(
-            p.firefox.launch(
-                headless=True,
-                proxy={
-                    "server": (
-                        f"http://{os.environ['PROXY_HOST']}:"
-                        f"{os.environ['PROXY_PORT']}"
-                    ),
-                    "username": os.environ.get("PROXY_USER", ""),
-                    "password": os.environ.get("PROXY_PASS", ""),
-                },
-            ),
-            timeout=30,
+        step("PLAYWRIGHT READY")
+
+        proxy = None
+
+        if os.environ.get("PROXY_HOST"):
+            proxy = {
+                "server": (
+                    f"http://{os.environ['PROXY_HOST']}:"
+                    f"{os.environ['PROXY_PORT']}"
+                ),
+                "username": os.environ.get("PROXY_USER", ""),
+                "password": os.environ.get("PROXY_PASS", "")
+            }
+
+        step("FIREFOX START")
+
+        browser = await p.firefox.launch(
+            headless=True,
+            proxy=proxy
         )
 
-        log("STEP 3: Firefox launched")
+        step("FIREFOX READY")
+
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Android 13; Mobile; rv:157.0) "
+                "Gecko/157.0 Firefox/157.0"
+            ),
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+            viewport={
+                "width": 412,
+                "height": 915
+            },
+            has_touch=True
+        )
+
+        page = await context.new_page()
+
+        step("OPEN OZON")
 
         try:
-            context = await browser.new_context(
-    user_agent=(
-        "Mozilla/5.0 (Android 13; Mobile; rv:157.0) "
-        "Gecko/157.0 Firefox/157.0"
-    ),
-    locale="ru-RU",
-    timezone_id="Europe/Moscow",
-    viewport={"width": 412, "height": 915},
-    has_touch=True,
-)
-
-            page = await context.new_page()
-            log("STEP 4: opening Ozon")
 
             response = await page.goto(
                 "https://www.ozon.ru/",
-                wait_until="domcontentloaded",
-                timeout=60000,
+                wait_until="commit",
+                timeout=60000
             )
 
-            log("STEP 5: Ozon response received")
+            step("PAGE COMMITTED")
 
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(15000)
 
             html = await page.content()
 
+            title = await page.title()
+
             result["ozon"] = {
+                "status": (
+                    response.status
+                    if response
+                    else None
+                ),
                 "url": page.url,
-                "title": await page.title(),
-                "status": response.status if response else None,
+                "title": title,
                 "html_length": len(html),
+
                 "markers": {
-                    "antibot": "antibot" in html.lower(),
-                    "challenge": "challenge" in html.lower(),
-                    "connection_error": "нет соединения" in html.lower(),
-                    "products": (
-                        "product" in html.lower()
-                        or "товар" in html.lower()
+                    "challenge": (
+                        "challenge"
+                        in html.lower()
+                        or "abt-challenge"
+                        in html.lower()
                     ),
+
+                    "connection_error": (
+                        "нет соединения"
+                        in html.lower()
+                    ),
+
+                    "antibot": (
+                        "antibot"
+                        in html.lower()
+                    ),
+
+                    "tilegrid": (
+                        "tilegrid"
+                        in html.lower()
+                    ),
+
+                    "pricev2": (
+                        "pricev2"
+                        in html.lower()
+                    ),
+
+                    "product": (
+                        "product"
+                        in html.lower()
+                        or "товар"
+                        in html.lower()
+                    )
                 },
+
+                "html_start": html[:2000]
             }
 
-            log("STEP 6: page analysis completed")
-            result["success"] = True
+            step("ANALYSIS COMPLETE")
 
-            await context.close()
-        finally:
-            await browser.close()
+
+        except Exception as e:
+
+            result["navigation_error"] = {
+                "type": type(e).__name__,
+                "message": str(e),
+            }
+
+            try:
+                html = await page.content()
+
+                result["after_error"] = {
+                    "url": page.url,
+                    "title": await page.title(),
+                    "html_length": len(html),
+                    "html_start": html[:2000]
+                }
+
+            except Exception:
+                pass
+
+
+        await context.close()
+        await browser.close()
+
 
     return result
 
 
+
 def worker():
+
     try:
-        print("FIREFOX TEST START", flush=True)
 
         result = asyncio.run(run_test())
 
@@ -158,90 +204,124 @@ def worker():
             STATE["result"] = result
             STATE["last_error"] = None
 
-        print("FIREFOX TEST COMPLETE", flush=True)
+        print("TEST FINISHED", flush=True)
 
-    except BaseException as exc:
-        error = {
-            "type": type(exc).__name__,
-            "message": str(exc),
-            "traceback": traceback.format_exc(),
+    except Exception as e:
+
+        err = {
+            "type": type(e).__name__,
+            "message": str(e),
+            "traceback": traceback.format_exc()
         }
 
         with LOCK:
-            STATE["last_error"] = error
+            STATE["last_error"] = err
 
-        print("FIREFOX TEST FAILED", flush=True)
-        print(error["traceback"], flush=True)
+        print("TEST ERROR", flush=True)
+        print(err["traceback"], flush=True)
 
     finally:
+
         with LOCK:
             STATE["running"] = False
 
 
-class Handler(BaseHTTPRequestHandler):
-    def send_json(self, data, status=200):
-        body = json.dumps(
-            data, ensure_ascii=False, indent=2
-        ).encode("utf-8")
 
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+class Handler(BaseHTTPRequestHandler):
+
+    def send_json(self, data):
+
+        body = json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2
+        ).encode()
+
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8"
+        )
+        self.send_header(
+            "Content-Length",
+            str(len(body))
+        )
         self.end_headers()
-        self.wfile.write(body)
+
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
 
     def do_GET(self):
+
         path = urlparse(self.path).path
 
-        if path == "/":
-            return self.send_json({
-                "app": "Glukolov Firefox diagnostic",
-                "routes": ["/health", "/diagnostics", "/test", "/status"],
-            })
 
         if path == "/health":
-            return self.send_json({"status": "ok", "port": PORT})
 
-        if path == "/diagnostics":
-            try:
-                return self.send_json(browser_diagnostics())
-            except Exception as exc:
-                return self.send_json({
-                    "error": str(exc),
-                    "traceback": traceback.format_exc(),
-                }, 500)
-
-        if path == "/test":
-            with LOCK:
-                if STATE["running"]:
-                    return self.send_json({
-                        "status": "already_running",
-                        "message": "Тест уже выполняется",
-                    })
-
-                STATE["running"] = True
-                STATE["result"] = None
-                STATE["last_error"] = None
-
-            threading.Thread(target=worker, daemon=True).start()
-
-            return self.send_json({
-                "status": "started",
-                "message": "Диагностический тест запущен",
-                "status_url": "/status",
+            self.send_json({
+                "status": "ok",
+                "project": "Glukolov Firefox Ozon commit test"
             })
 
-        if path == "/status":
-            with LOCK:
-                return self.send_json(dict(STATE))
 
-        return self.send_json({"error": "not found"}, 404)
+        elif path == "/test":
+
+            with LOCK:
+
+                if not STATE["running"]:
+
+                    STATE["running"] = True
+                    STATE["result"] = None
+                    STATE["last_error"] = None
+
+                    threading.Thread(
+                        target=worker,
+                        daemon=True
+                    ).start()
+
+
+            self.send_json({
+                "status": "started"
+            })
+
+
+        elif path == "/status":
+
+            with LOCK:
+                self.send_json(dict(STATE))
+
+
+        else:
+
+            self.send_json({
+                "routes": [
+                    "/health",
+                    "/test",
+                    "/status"
+                ]
+            })
+
 
     def log_message(self, fmt, *args):
-        print("%s - %s" % (self.address_string(), fmt % args), flush=True)
+        print(
+            fmt % args,
+            flush=True
+        )
 
 
-print(f"Glukolov Firefox diagnostic listening on {PORT}", flush=True)
 
-server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+print(
+    f"Glukolov Firefox Ozon commit test listening {PORT}",
+    flush=True
+)
+
+
+server = ThreadingHTTPServer(
+    ("0.0.0.0", PORT),
+    Handler
+)
+
 server.serve_forever()
