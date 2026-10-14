@@ -1,11 +1,13 @@
 import os
 import json
 import time
-import asyncio
 import threading
 import traceback
+import requests
+
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+
 
 PORT = int(os.environ.get("PORT", "8080"))
 
@@ -18,7 +20,22 @@ STATE = {
 LOCK = threading.Lock()
 
 
-async def fetch_page(page, url, timeout=20000):
+HEADERS = {
+    "User-Agent":
+        "Mozilla/5.0 (Android 13; Mobile; rv:157.0) "
+        "Gecko/157.0 Firefox/157.0",
+
+    "Accept":
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,*/*;q=0.8",
+
+    "Accept-Language":
+        "ru-RU"
+}
+
+
+
+def check_url(url, timeout=20):
 
     result = {
         "url": url
@@ -26,29 +43,61 @@ async def fetch_page(page, url, timeout=20000):
 
     try:
 
-        response = await page.goto(
+        r = requests.get(
             url,
-            wait_until="commit",
-            timeout=timeout
+            headers=HEADERS,
+            timeout=timeout,
+            allow_redirects=True
         )
 
-        await page.wait_for_timeout(2000)
 
-        try:
-            html = await page.content()
-        except:
-            html = ""
+        text = r.text[:2000]
+
 
         result.update({
-            "status": (
-                response.status
-                if response
-                else None
-            ),
-            "final_url": page.url,
-            "title": await page.title(),
-            "html_length": len(html),
-            "html_start": html[:500]
+
+            "status":
+                r.status_code,
+
+            "final_url":
+                r.url,
+
+            "content_type":
+                r.headers.get(
+                    "content-type"
+                ),
+
+            "length":
+                len(r.text),
+
+
+            "markers": {
+
+                "challenge":
+                    "challenge"
+                    in r.text.lower(),
+
+                "antibot":
+                    "antibot"
+                    in r.text.lower(),
+
+                "connection_error":
+                    "нет соединения"
+                    in r.text.lower(),
+
+                "product":
+                    "product"
+                    in r.text.lower(),
+
+                "tilegrid":
+                    "tilegrid"
+                    in r.text.lower()
+            },
+
+
+            "body_start":
+                text
+
         })
 
 
@@ -56,83 +105,41 @@ async def fetch_page(page, url, timeout=20000):
 
         result["error"] = str(e)
 
-        try:
-            result["current_url"] = page.url
-        except:
-            pass
-
 
     return result
 
 
 
-async def run_test():
-
-    from playwright.async_api import async_playwright
-
+def run_test():
 
     result = {
-        "project": "Glukolov Firefox network comparison",
-        "started_at": time.strftime("%Y-%m-%d %H:%M:%S")
+
+        "project":
+            "Glukolov Python network test",
+
+        "started_at":
+            time.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+
+        "tests": {}
+
     }
 
 
-    async with async_playwright() as p:
+    result["tests"]["ipify"] = check_url(
+        "https://api.ipify.org/?format=json"
+    )
 
 
-        browser = await p.firefox.launch(
-            headless=True
-        )
+    result["tests"]["httpbin"] = check_url(
+        "https://httpbin.org/get"
+    )
 
 
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Android 13; Mobile; rv:157.0) "
-                "Gecko/157.0 Firefox/157.0"
-            ),
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-            viewport={
-                "width":412,
-                "height":915
-            },
-            has_touch=True
-        )
-
-
-        page = await context.new_page()
-
-
-        result["tests"] = {}
-
-
-        print("TEST IPIFY", flush=True)
-
-        result["tests"]["ipify"] = await fetch_page(
-            page,
-            "https://api.ipify.org/?format=json"
-        )
-
-
-        print("TEST HTTPBIN", flush=True)
-
-        result["tests"]["httpbin"] = await fetch_page(
-            page,
-            "https://httpbin.org/get"
-        )
-
-
-        print("TEST OZON", flush=True)
-
-        result["tests"]["ozon"] = await fetch_page(
-            page,
-            "https://www.ozon.ru/",
-            timeout=30000
-        )
-
-
-        await context.close()
-        await browser.close()
+    result["tests"]["ozon"] = check_url(
+        "https://www.ozon.ru/"
+    )
 
 
     return result
@@ -143,9 +150,7 @@ def worker():
 
     try:
 
-        res = asyncio.run(
-            run_test()
-        )
+        res = run_test()
 
         with LOCK:
 
@@ -158,15 +163,22 @@ def worker():
         with LOCK:
 
             STATE["last_error"] = {
-                "type": type(e).__name__,
-                "message": str(e),
-                "traceback": traceback.format_exc()
+
+                "type":
+                    type(e).__name__,
+
+                "message":
+                    str(e),
+
+                "traceback":
+                    traceback.format_exc()
             }
 
 
     finally:
 
         with LOCK:
+
             STATE["running"] = False
 
 
@@ -211,8 +223,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
 
             self.send_json({
-                "status":"ok",
-                "project":"Glukolov Firefox network comparison"
+
+                "status":
+                    "ok",
+
+                "project":
+                    "Glukolov Python network test"
+
             })
 
 
@@ -234,13 +251,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
             self.send_json({
-                "status":"started"
+                "status":
+                    "started"
             })
 
 
         elif path == "/status":
 
             with LOCK:
+
                 self.send_json(
                     STATE
                 )
@@ -249,16 +268,21 @@ class Handler(BaseHTTPRequestHandler):
         else:
 
             self.send_json({
-                "routes":[
+
+                "routes": [
+
                     "/health",
                     "/test",
                     "/status"
+
                 ]
+
             })
 
 
 
     def log_message(self, fmt, *args):
+
         print(
             fmt % args,
             flush=True
@@ -267,7 +291,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 print(
-    f"Glukolov Firefox network comparison listening {PORT}",
+    f"Glukolov Python network test listening {PORT}",
     flush=True
 )
 
