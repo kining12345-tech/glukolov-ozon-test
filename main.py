@@ -1,3 +1,5 @@
+print("VERSION: COMMIT TEST v2", flush=True)
+
 async def inspect(page):
 
     print(
