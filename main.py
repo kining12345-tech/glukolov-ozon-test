@@ -4,7 +4,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, urljoin
 
 import requests
 
@@ -33,6 +33,25 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def safe_location(value):
+    if not value:
+        return None
+
+    try:
+        parsed = urlparse(value)
+        result = parsed.path or "/"
+
+        if parsed.query:
+            result += "?" + parsed.query
+
+        if parsed.fragment:
+            result += "#" + parsed.fragment
+
+        return result[:2000]
+    except Exception:
+        return None
+
+
 def get_proxy_url():
     direct_url = os.getenv("PROXY_URL")
     if direct_url:
@@ -56,67 +75,8 @@ def get_proxy_url():
     return f"http://{host}:{port}"
 
 
-def safe_location(value):
-    """Возвращает путь и параметры URL без домена и учётных данных."""
-    if not value:
-        return None
-
-    try:
-        parsed = urlparse(value)
-        result = parsed.path or "/"
-
-        if parsed.query:
-            result += "?" + parsed.query
-
-        if parsed.fragment:
-            result += "#" + parsed.fragment
-
-        return result[:2000]
-    except Exception:
-        return None
-
-
-def inspect_response(response):
-    body = response.text[:50000]
-    lower = body.lower()
-    location = response.headers.get("Location")
-
+def make_headers():
     return {
-        "status": response.status_code,
-        "request_url_path": safe_location(response.request.url),
-        "final_url_path": safe_location(response.url),
-        "location_header": safe_location(location),
-        "content_type": response.headers.get("Content-Type"),
-        "server": response.headers.get("Server"),
-        "body_length": len(response.content),
-        "body_preview": body[:1200],
-        "markers": {
-            "antibot": "antibot" in lower,
-            "challenge": "challenge" in lower,
-            "captcha": "captcha" in lower,
-            "incident_id": "incidentid" in lower,
-            "rr_redirect": (
-                "__rr=1" in (location or "")
-                or "__rr=1" in lower
-            ),
-            "widget_states": "widgetStates" in body,
-            "tile_grid": "tileGrid2" in body,
-            "price_v2": "priceV2" in body,
-            "challenge_url": "challengeurl" in lower,
-        },
-    }
-
-
-def perform_request(label, library, proxy_url, target):
-    result = {
-        "test": label,
-        "library": library,
-        "proxy": "configured" if proxy_url else "direct",
-        "target": target["name"],
-        "started_at": now(),
-    }
-
-    headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -130,50 +90,106 @@ def perform_request(label, library, proxy_url, target):
         "Cache-Control": "no-cache",
     }
 
-    proxies = None
+
+def inspect_response(response):
+    body = response.text[:50000]
+    lower = body.lower()
+
+    return {
+        "status": response.status_code,
+        "url_path": safe_location(response.url),
+        "location": safe_location(response.headers.get("Location")),
+        "content_type": response.headers.get("Content-Type"),
+        "server": response.headers.get("Server"),
+        "body_length": len(response.content),
+        "body_preview": body[:800],
+        "markers": {
+            "antibot": "antibot" in lower,
+            "challenge": "challenge" in lower,
+            "captcha": "captcha" in lower,
+            "incident_id": "incidentid" in lower,
+            "rr_redirect": "__rr=1" in lower
+            or "__rr=1" in response.headers.get("Location", ""),
+            "widget_states": "widgetStates" in body,
+            "tile_grid": "tileGrid2" in body,
+            "price_v2": "priceV2" in body,
+            "challenge_url": "challengeurl" in lower,
+        },
+    }
+
+
+def request_once(url, proxy_url, library="requests"):
+    kwargs = {
+        "headers": make_headers(),
+        "timeout": 15,
+        "allow_redirects": False,
+    }
+
     if proxy_url:
-        proxies = {
+        kwargs["proxies"] = {
             "http": proxy_url,
             "https": proxy_url,
         }
 
+    if library == "curl_cffi":
+        if not CURL_CFFI_AVAILABLE:
+            raise RuntimeError("curl_cffi is not installed")
+
+        return curl_requests.get(
+            url,
+            impersonate="chrome",
+            **kwargs,
+        )
+
+    return requests.get(url, **kwargs)
+
+
+def trace_redirects(label, initial_url, proxy_url, library):
+    result = {
+        "test": label,
+        "library": library,
+        "proxy": "configured" if proxy_url else "direct",
+        "initial_url_path": safe_location(initial_url),
+        "hops": [],
+        "error": None,
+    }
+
+    current_url = initial_url
+    seen = set()
+
     try:
-        if library == "curl_cffi":
-            if not CURL_CFFI_AVAILABLE:
-                raise RuntimeError("curl_cffi is not installed")
+        for index in range(5):
+            if current_url in seen:
+                result["error"] = "Redirect loop detected"
+                break
 
-            response = curl_requests.get(
-                target["url"],
-                params=target.get("params"),
-                headers=headers,
-                proxies=proxies,
-                impersonate="chrome",
-                timeout=20,
-                allow_redirects=False,
-            )
-        else:
-            response = requests.get(
-                target["url"],
-                params=target.get("params"),
-                headers=headers,
-                proxies=proxies,
-                timeout=20,
-                allow_redirects=False,
+            seen.add(current_url)
+
+            response = request_once(
+                current_url,
+                proxy_url,
+                library,
             )
 
-        result.update(inspect_response(response))
+            hop = inspect_response(response)
+            hop["hop"] = index + 1
+            result["hops"].append(hop)
 
-        if target["name"] == "ipify" and response.ok:
-            try:
-                result["external_ip"] = response.json().get("ip")
-            except Exception:
-                result["external_ip"] = "Could not parse IP"
+            if response.status_code not in (301, 302, 303, 307, 308):
+                break
+
+            location = response.headers.get("Location")
+            if not location:
+                break
+
+            current_url = urljoin(current_url, location)
+            time.sleep(0.3)
 
     except Exception as exc:
-        result["error_type"] = type(exc).__name__
-        result["error"] = str(exc)[:500]
+        result["error"] = (
+            f"{type(exc).__name__}: {str(exc)[:300]}"
+        )
 
-    result["finished_at"] = now()
     return result
 
 
@@ -181,37 +197,31 @@ def run_diagnostics():
     proxy_url = get_proxy_url()
 
     targets = [
-        {
-            "name": "ipify",
-            "url": "https://api.ipify.org/",
-            "params": {"format": "json"},
-        },
-        {
-            "name": "ozon_home",
-            "url": "https://www.ozon.ru/",
-        },
-        {
-            "name": "ozon_catalog_api",
-            "url": (
-                "https://www.ozon.ru/"
-                "api/entrypoint-api.bx/page/json/v2"
-            ),
-            "params": {
-                "url": "/category/bluzy-i-rubashki-zhenskie-7511/"
-            },
-        },
-    ]
-
-    plans = [
-        ("requests_direct", "requests", None),
-        ("requests_proxy", "requests", proxy_url),
-        ("curl_cffi_proxy", "curl_cffi", proxy_url),
+        (
+            "ozon_home_direct",
+            "https://www.ozon.ru/",
+            None,
+            "requests",
+        ),
+        (
+            "ozon_home_proxy",
+            "https://www.ozon.ru/",
+            proxy_url,
+            "requests",
+        ),
+        (
+            "ozon_api_proxy",
+            "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2"
+            "?url=%2Fcategory%2Fbluzy-i-rubashki-zhenskie-7511%2F",
+            proxy_url,
+            "requests",
+        ),
     ]
 
     results = []
 
     try:
-        for label, library, proxy in plans:
+        for label, url, proxy, library in targets:
             if label.endswith("_proxy") and not proxy:
                 results.append({
                     "test": label,
@@ -220,27 +230,22 @@ def run_diagnostics():
                 })
                 continue
 
-            for target in targets:
-                item = perform_request(
-                    label,
-                    library,
-                    proxy,
-                    target,
-                )
+            item = trace_redirects(
+                label,
+                url,
+                proxy,
+                library,
+            )
 
-                results.append(item)
+            results.append(item)
 
-                with state_lock:
-                    state["results"] = list(results)
+            with state_lock:
+                state["results"] = list(results)
 
-                # Не выводим полный URL запроса в логах:
-                # он может содержать параметры сессии.
-                print(
-                    json.dumps(item, ensure_ascii=False),
-                    flush=True,
-                )
-
-                time.sleep(1)
+            print(
+                json.dumps(item, ensure_ascii=False),
+                flush=True,
+            )
 
         with state_lock:
             state["status"] = "COMPLETED"
@@ -283,7 +288,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self.send_json({
                 "ok": True,
-                "project": "Glukolov HTTP diagnostics",
                 "proxy_configured": bool(get_proxy_url()),
                 "curl_cffi_available": CURL_CFFI_AVAILABLE,
                 "browser_required": False,
@@ -308,15 +312,13 @@ class Handler(BaseHTTPRequestHandler):
                     "error": None,
                 })
 
-            thread = threading.Thread(
+            threading.Thread(
                 target=run_diagnostics,
                 daemon=True,
-            )
-            thread.start()
+            ).start()
 
             self.send_json({
                 "started": True,
-                "message": "HTTP diagnostics started",
                 "status_url": "/status",
             })
             return
@@ -340,7 +342,6 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def log_message(self, fmt, *args):
-        # Не выводим URL целиком, чтобы не раскрывать параметры.
         print(
             f"{datetime.now().isoformat()} HTTP request",
             flush=True,
