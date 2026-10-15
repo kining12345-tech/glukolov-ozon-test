@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -58,32 +57,48 @@ def get_proxy_url():
 
 
 def safe_location(value):
+    """Возвращает путь и параметры URL без домена и учётных данных."""
     if not value:
         return None
 
-    parsed = urlparse(value)
-    return parsed.path or "/"
+    try:
+        parsed = urlparse(value)
+        result = parsed.path or "/"
+
+        if parsed.query:
+            result += "?" + parsed.query
+
+        if parsed.fragment:
+            result += "#" + parsed.fragment
+
+        return result[:2000]
+    except Exception:
+        return None
 
 
 def inspect_response(response):
     body = response.text[:50000]
     lower = body.lower()
-
     location = response.headers.get("Location")
 
     return {
         "status": response.status_code,
+        "request_url_path": safe_location(response.request.url),
         "final_url_path": safe_location(response.url),
-        "redirect_path": safe_location(location),
+        "location_header": safe_location(location),
         "content_type": response.headers.get("Content-Type"),
         "server": response.headers.get("Server"),
         "body_length": len(response.content),
+        "body_preview": body[:1200],
         "markers": {
             "antibot": "antibot" in lower,
             "challenge": "challenge" in lower,
             "captcha": "captcha" in lower,
             "incident_id": "incidentid" in lower,
-            "rr_redirect": "__rr=1" in lower,
+            "rr_redirect": (
+                "__rr=1" in (location or "")
+                or "__rr=1" in lower
+            ),
             "widget_states": "widgetStates" in body,
             "tile_grid": "tileGrid2" in body,
             "price_v2": "priceV2" in body,
@@ -212,11 +227,14 @@ def run_diagnostics():
                     proxy,
                     target,
                 )
+
                 results.append(item)
 
                 with state_lock:
                     state["results"] = list(results)
 
+                # Не выводим полный URL запроса в логах:
+                # он может содержать параметры сессии.
                 print(
                     json.dumps(item, ensure_ascii=False),
                     flush=True,
@@ -308,6 +326,7 @@ class Handler(BaseHTTPRequestHandler):
                 snapshot = json.loads(
                     json.dumps(state, ensure_ascii=False)
                 )
+
             self.send_json(snapshot)
             return
 
@@ -321,9 +340,9 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def log_message(self, fmt, *args):
+        # Не выводим URL целиком, чтобы не раскрывать параметры.
         print(
-            f"{datetime.now().isoformat()} "
-            + (fmt % args),
+            f"{datetime.now().isoformat()} HTTP request",
             flush=True,
         )
 
@@ -337,4 +356,5 @@ server = ThreadingHTTPServer(
     ("0.0.0.0", PORT),
     Handler,
 )
+
 server.serve_forever()
