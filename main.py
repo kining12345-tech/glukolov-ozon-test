@@ -5,7 +5,6 @@ import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote
 
 from playwright.async_api import async_playwright
 
@@ -15,14 +14,14 @@ PORT = int(os.environ.get("PORT", "8000"))
 status = {
     "running": False,
     "result": None,
-    "last_error": None
+    "last_error": None,
 }
 
 status_lock = threading.Lock()
 
 
-def mark(text):
-    print(text, flush=True)
+def log(message):
+    print(message, flush=True)
 
 
 def get_proxy():
@@ -50,38 +49,38 @@ def get_proxy():
     return proxy
 
 
-async def chromium_test():
+async def run_browser_test(playwright, browser_name):
     result = {
-        "project": "Glukolov Chromium Russian proxy test",
+        "browser": browser_name,
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "browser": "Chromium",
-        "proxy_configured": False,
         "steps": [],
-        "tests": {}
+        "tests": {},
     }
 
     proxy = get_proxy()
     result["proxy_configured"] = bool(proxy)
 
-    if not proxy:
-        result["steps"].append("PROXY_NOT_CONFIGURED")
+    try:
+        if browser_name == "chromium":
+            browser = await playwright.chromium.launch(
+                headless=True,
+                channel="chromium",
+                proxy=proxy,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+        elif browser_name == "firefox":
+            browser = await playwright.firefox.launch(
+                headless=True,
+                proxy=proxy,
+            )
+        else:
+            raise ValueError("Unsupported browser")
 
-    async with async_playwright() as p:
-        result["steps"].append("PLAYWRIGHT_READY")
-        mark("PLAYWRIGHT READY")
-
-        browser = await p.chromium.launch(
-            headless=True,
-            channel="chromium",
-            proxy=proxy,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage"
-            ]
-        )
-
-        result["steps"].append("CHROMIUM_STARTED")
-        mark("CHROMIUM STARTED")
+        result["steps"].append("BROWSER_STARTED")
+        log(f"{browser_name}: BROWSER_STARTED")
 
         try:
             context = await browser.new_context(
@@ -91,7 +90,18 @@ async def chromium_test():
                     "Chrome/141.0.0.0 Mobile Safari/537.36"
                 ),
                 locale="ru-RU",
-                viewport={"width": 390, "height": 844}
+                viewport={"width": 390, "height": 844},
+                is_mobile=True,
+                has_touch=True,
+            ) if browser_name == "chromium" else await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Android 13; Mobile; rv:128.0) "
+                    "Gecko/128.0 Firefox/128.0"
+                ),
+                locale="ru-RU",
+                viewport={"width": 390, "height": 844},
+                is_mobile=True,
+                has_touch=True,
             )
 
             page = await context.new_page()
@@ -103,7 +113,7 @@ async def chromium_test():
                     response = await page.goto(
                         url,
                         wait_until="commit",
-                        timeout=20000
+                        timeout=25000,
                     )
 
                     item["status"] = (
@@ -114,77 +124,117 @@ async def chromium_test():
 
                     html = await page.content()
                     item["html_length"] = len(html)
+
                     item["markers"] = {
                         "challenge": "challenge" in html.lower(),
                         "antibot": "antibot" in html.lower(),
+                        "captcha": "captcha" in html.lower(),
                         "tilegrid": "tilegrid" in html.lower(),
                         "pricev2": "priceV2" in html,
-                        "product": "product" in html.lower()
+                        "product": "product" in html.lower(),
                     }
 
                     if name == "ipify":
-                        try:
-                            item["body_text"] = (
-                                await page.locator("body").inner_text()
-                            )[:1000]
-                        except Exception:
-                            pass
+                        item["body_text"] = (
+                            await page.locator("body").inner_text()
+                        )[:1000]
 
-                except Exception as e:
-                    item["error"] = str(e)
+                    if name == "ozon":
+                        item["page_excerpt"] = html[:2500]
+
+                except Exception as exc:
+                    item["error"] = str(exc)
                     item["current_url"] = page.url
 
                 result["tests"][name] = item
-                mark(f"{name.upper()} DONE: {item}")
+                log(
+                    f"{browser_name} {name}: "
+                    + json.dumps(item, ensure_ascii=False)
+                )
 
-            result["steps"].append("PROXY_CONFIG_OK" if proxy else "NO_PROXY")
+            result["steps"].append(
+                "PROXY_CONFIGURED" if proxy else "NO_PROXY"
+            )
 
             await check(
                 "ipify",
-                "https://api.ipify.org/?format=json"
+                "https://api.ipify.org/?format=json",
             )
-            result["steps"].append("IP_DONE")
 
             await check(
                 "httpbin",
-                "https://httpbin.org/get"
+                "https://httpbin.org/get",
             )
-            result["steps"].append("HTTPBIN_DONE")
 
             await check(
                 "ozon",
-                "https://www.ozon.ru/"
+                "https://www.ozon.ru/",
             )
-            result["steps"].append("OZON_DONE")
+
+            await context.close()
 
         finally:
             await browser.close()
+
+    except Exception as exc:
+        result["error"] = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        log(f"{browser_name} FAILED: {exc}")
 
     result["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     return result
 
 
+async def run_all_tests():
+    combined = {
+        "project": "Glukolov Chromium and Firefox proxy comparison",
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "proxy_configured": bool(get_proxy()),
+        "browsers": {},
+    }
+
+    async with async_playwright() as playwright:
+        combined["browsers"]["chromium"] = await run_browser_test(
+            playwright,
+            "chromium",
+        )
+
+        combined["browsers"]["firefox"] = await run_browser_test(
+            playwright,
+            "firefox",
+        )
+
+    combined["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    return combined
+
+
 def worker():
+    global status
+
     with status_lock:
         if status["running"]:
             return
+
         status["running"] = True
         status["last_error"] = None
 
     try:
-        result = asyncio.run(chromium_test())
+        result = asyncio.run(run_all_tests())
 
         with status_lock:
             status["result"] = result
 
-    except Exception as e:
+    except Exception as exc:
         error = {
-            "type": type(e).__name__,
-            "message": str(e),
-            "traceback": traceback.format_exc()
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
         }
 
-        mark("TEST FAILED: " + json.dumps(error, ensure_ascii=False))
+        log("TEST FAILED: " + json.dumps(error, ensure_ascii=False))
 
         with status_lock:
             status["last_error"] = error
@@ -195,33 +245,37 @@ def worker():
 
 
 class Handler(BaseHTTPRequestHandler):
-    def respond_json(self, data, code=200):
+    def send_json(self, data, code=200):
         body = json.dumps(
-            data, ensure_ascii=False
+            data,
+            ensure_ascii=False,
         ).encode("utf-8")
 
         self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8",
+        )
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
         if self.path.startswith("/health"):
-            self.respond_json({
+            self.send_json({
                 "ok": True,
-                "project": "Glukolov Chromium Russian proxy test",
+                "project": "Glukolov Chromium and Firefox proxy test",
                 "port": PORT,
+                "proxy_configured": bool(get_proxy()),
                 "proxy_variables_present": {
-                    key: bool(os.getenv(key))
-                    for key in (
+                    name: bool(os.getenv(name))
+                    for name in (
                         "PROXY_HOST",
                         "PROXY_PORT",
                         "PROXY_USER",
-                        "PROXY_PASS"
+                        "PROXY_PASS",
                     )
                 },
-                "proxy_configured": bool(get_proxy())
             })
             return
 
@@ -230,11 +284,14 @@ class Handler(BaseHTTPRequestHandler):
                 already_running = status["running"]
 
             if not already_running:
-                threading.Thread(target=worker, daemon=True).start()
+                threading.Thread(
+                    target=worker,
+                    daemon=True,
+                ).start()
 
-            self.respond_json({
+            self.send_json({
                 "started": not already_running,
-                "already_running": already_running
+                "already_running": already_running,
             })
             return
 
@@ -242,21 +299,21 @@ class Handler(BaseHTTPRequestHandler):
             with status_lock:
                 snapshot = dict(status)
 
-            self.respond_json(snapshot)
+            self.send_json(snapshot)
             return
 
-        self.respond_json({
-            "project": "Glukolov Chromium Russian proxy test",
-            "endpoints": ["/health", "/test", "/status"]
+        self.send_json({
+            "project": "Glukolov Chromium and Firefox proxy test",
+            "endpoints": ["/health", "/test", "/status"],
         })
 
     def log_message(self, fmt, *args):
-        mark("HTTP " + (fmt % args))
+        log("HTTP " + (fmt % args))
 
 
-mark(f"Glukolov Chromium Russian proxy test listening on port {PORT}")
+log(f"Glukolov browser comparison listening on port {PORT}")
 
 ThreadingHTTPServer(
     ("0.0.0.0", PORT),
-    Handler
+    Handler,
 ).serve_forever()
