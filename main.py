@@ -1,495 +1,244 @@
-import asyncio
 import json
 import os
+import re
 import threading
 import time
-import traceback
-import uuid
-
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, quote
 
-from playwright.async_api import async_playwright
+import requests
+
+try:
+    from curl_cffi import requests as curl_requests
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    curl_requests = None
+    CURL_CFFI_AVAILABLE = False
 
 
 PORT = int(os.environ.get("PORT", "8000"))
-INSTANCE_ID = str(uuid.uuid4())[:8]
 
 state_lock = threading.Lock()
-
 state = {
-    "instance_id": INSTANCE_ID,
     "running": False,
     "started_at": None,
     "finished_at": None,
-    "progress": "IDLE",
-    "result": None,
-    "last_error": None,
+    "status": "IDLE",
+    "results": [],
+    "error": None,
 }
 
 
 def now():
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).isoformat()
 
 
-def log(message):
-    print(f"{now()} {message}", flush=True)
-
-
-def get_proxy():
-    proxy_url = os.getenv("PROXY_URL")
-
-    if proxy_url:
-        return {"server": proxy_url}
+def get_proxy_url():
+    direct_url = os.getenv("PROXY_URL")
+    if direct_url:
+        return direct_url
 
     host = os.getenv("PROXY_HOST")
     port = os.getenv("PROXY_PORT")
-    user = os.getenv("PROXY_USER")
-    password = os.getenv("PROXY_PASS")
 
     if not host or not port:
         return None
 
-    proxy = {"server": f"http://{host}:{port}"}
+    user = os.getenv("PROXY_USER")
+    password = os.getenv("PROXY_PASS")
 
     if user:
-        proxy["username"] = user
+        auth = quote(user, safe="")
+        if password:
+            auth += ":" + quote(password, safe="")
+        return f"http://{auth}@{host}:{port}"
 
-    if password:
-        proxy["password"] = password
-
-    return proxy
-
-
-def snapshot():
-    with state_lock:
-        return json.loads(json.dumps(state, ensure_ascii=False))
+    return f"http://{host}:{port}"
 
 
-def update_state(**kwargs):
-    with state_lock:
-        state.update(kwargs)
+def safe_location(value):
+    if not value:
+        return None
+
+    parsed = urlparse(value)
+    return parsed.path or "/"
 
 
-def update_result(browser_name, test_name, data):
-    with state_lock:
-        if state["result"] is None:
-            state["result"] = {
-                "instance_id": INSTANCE_ID,
-                "browsers": {},
-            }
+def inspect_response(response):
+    body = response.text[:50000]
+    lower = body.lower()
 
-        browsers = state["result"]["browsers"]
+    location = response.headers.get("Location")
 
-        if browser_name not in browsers:
-            browsers[browser_name] = {
-                "tests": {},
-                "steps": [],
-            }
-
-        browser = browsers[browser_name]
-
-        if test_name == "_step":
-            browser["steps"].append({
-                "time": now(),
-                "step": data,
-            })
-        elif test_name == "_error":
-            browser["error"] = data
-        else:
-            browser["tests"][test_name] = data
-
-        browser["updated_at"] = now()
-
-
-def set_step(browser_name, step):
-    progress = f"{browser_name}: {step}"
-
-    update_state(progress=progress)
-    update_result(browser_name, "_step", step)
-
-    log(progress)
-
-
-async def safe_value(awaitable, timeout=3):
-    try:
-        return await asyncio.wait_for(
-            awaitable,
-            timeout=timeout,
-        )
-    except Exception as exc:
-        return {
-            "error_type": type(exc).__name__,
-            "error": str(exc)[:300],
-        }
-
-
-async def run_browser_test(playwright, browser_name):
-    proxy = get_proxy()
-    browser = None
-    context = None
-    page = None
-
-    result = {
-        "browser": browser_name,
-        "instance_id": INSTANCE_ID,
-        "proxy_configured": bool(proxy),
-        "started_at": now(),
-        "tests": {},
-        "status": "RUNNING",
+    return {
+        "status": response.status_code,
+        "final_url_path": safe_location(response.url),
+        "redirect_path": safe_location(location),
+        "content_type": response.headers.get("Content-Type"),
+        "server": response.headers.get("Server"),
+        "body_length": len(response.content),
+        "markers": {
+            "antibot": "antibot" in lower,
+            "challenge": "challenge" in lower,
+            "captcha": "captcha" in lower,
+            "incident_id": "incidentid" in lower,
+            "rr_redirect": "__rr=1" in lower,
+            "widget_states": "widgetStates" in body,
+            "tile_grid": "tileGrid2" in body,
+            "price_v2": "priceV2" in body,
+            "challenge_url": "challengeurl" in lower,
+        },
     }
 
-    set_step(browser_name, "LAUNCHING")
+
+def perform_request(label, library, proxy_url, target):
+    result = {
+        "test": label,
+        "library": library,
+        "proxy": "configured" if proxy_url else "direct",
+        "target": target["name"],
+        "started_at": now(),
+    }
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/141.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/json,"
+            "application/signed-exchange;v=b3;q=0.9,*/*;q=0.8"
+        ),
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+    }
+
+    proxies = None
+    if proxy_url:
+        proxies = {
+            "http": proxy_url,
+            "https": proxy_url,
+        }
 
     try:
-        if browser_name == "chromium":
-            browser = await asyncio.wait_for(
-                playwright.chromium.launch(
-                    headless=True,
-                    channel="chromium",
-                    proxy=proxy,
-                    timeout=20000,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                    ],
-                ),
-                timeout=25,
-            )
+        if library == "curl_cffi":
+            if not CURL_CFFI_AVAILABLE:
+                raise RuntimeError("curl_cffi is not installed")
 
-            user_agent = (
-                "Mozilla/5.0 (Linux; Android 13; Mobile) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/141.0.0.0 Mobile Safari/537.36"
-            )
-
-        elif browser_name == "firefox":
-            browser = await asyncio.wait_for(
-                playwright.firefox.launch(
-                    headless=True,
-                    proxy=proxy,
-                    timeout=20000,
-                ),
-                timeout=25,
-            )
-
-            user_agent = (
-                "Mozilla/5.0 (Android 13; Mobile; rv:128.0) "
-                "Gecko/128.0 Firefox/128.0"
-            )
-
-        else:
-            raise ValueError("Unknown browser")
-
-        set_step(browser_name, "BROWSER_STARTED")
-
-        options = {
-            "user_agent": user_agent,
-            "locale": "ru-RU",
-            "viewport": {
-                "width": 390,
-                "height": 844,
-            },
-        }
-
-        if browser_name == "firefox":
-            # Альтернативный путь:
-            # создаём вкладку вместе с новым контекстом.
-            set_step(browser_name, "FIREFOX_NEW_PAGE_START")
-
-            page = await asyncio.wait_for(
-                browser.new_page(**options),
+            response = curl_requests.get(
+                target["url"],
+                params=target.get("params"),
+                headers=headers,
+                proxies=proxies,
+                impersonate="chrome",
                 timeout=20,
+                allow_redirects=False,
             )
-
-            context = page.context
-
-            set_step(browser_name, "FIREFOX_NEW_PAGE_OK")
-
         else:
-            set_step(browser_name, "CHROMIUM_CONTEXT_START")
-
-            context = await asyncio.wait_for(
-                browser.new_context(**options),
-                timeout=15,
+            response = requests.get(
+                target["url"],
+                params=target.get("params"),
+                headers=headers,
+                proxies=proxies,
+                timeout=20,
+                allow_redirects=False,
             )
 
-            set_step(browser_name, "CHROMIUM_CONTEXT_OK")
+        result.update(inspect_response(response))
 
-            page = await asyncio.wait_for(
-                context.new_page(),
-                timeout=10,
-            )
-
-            set_step(browser_name, "CHROMIUM_PAGE_OK")
-
-        page.set_default_navigation_timeout(15000)
-        page.set_default_timeout(5000)
-
-        checks = [
-            (
-                "ipify",
-                "https://api.ipify.org/?format=json",
-            ),
-            (
-                "httpbin",
-                "https://httpbin.org/get",
-            ),
-            (
-                "ozon",
-                "https://www.ozon.ru/",
-            ),
-        ]
-
-        for test_name, url in checks:
-            set_step(
-                browser_name,
-                f"{test_name.upper()}_START",
-            )
-
-            item = {
-                "url": url,
-                "started_at": now(),
-            }
-
+        if target["name"] == "ipify" and response.ok:
             try:
-                response = await asyncio.wait_for(
-                    page.goto(
-                        url,
-                        wait_until="commit",
-                        timeout=15000,
-                    ),
-                    timeout=18,
-                )
-
-                item["status"] = (
-                    response.status if response else None
-                )
-                item["final_url"] = page.url
-
-                title = await safe_value(
-                    page.title(),
-                    timeout=3,
-                )
-
-                item["title"] = title
-
-                html = await safe_value(
-                    page.content(),
-                    timeout=3,
-                )
-
-                if isinstance(html, str):
-                    item["html_length"] = len(html)
-                    lowered = html.lower()
-
-                    item["markers"] = {
-                        "challenge": "challenge" in lowered,
-                        "antibot": "antibot" in lowered,
-                        "captcha": "captcha" in lowered,
-                        "tilegrid": "tilegrid" in lowered,
-                        "pricev2": "priceV2" in html,
-                        "product": "product" in lowered,
-                    }
-                else:
-                    item["html_error"] = html
-
-                if test_name in ("ipify", "ozon"):
-                    body = await safe_value(
-                        page.locator("body").inner_text(),
-                        timeout=3,
-                    )
-
-                    if isinstance(body, str):
-                        key = (
-                            "body_text"
-                            if test_name == "ipify"
-                            else "page_text"
-                        )
-                        limit = 500 if test_name == "ipify" else 1500
-                        item[key] = body[:limit]
-                    else:
-                        item["body_error"] = body
-
-            except Exception as exc:
-                item["error_type"] = type(exc).__name__
-                item["error"] = str(exc)[:1000]
-
-                try:
-                    item["current_url"] = page.url
-                except Exception:
-                    pass
-
-                log(
-                    f"{browser_name} {test_name} ERROR: "
-                    f"{type(exc).__name__}: {str(exc)[:300]}"
-                )
-
-            item["finished_at"] = now()
-
-            result["tests"][test_name] = item
-
-            update_result(
-                browser_name,
-                test_name,
-                item,
-            )
-
-            log(
-                f"{browser_name} {test_name} RESULT: "
-                + json.dumps(item, ensure_ascii=False)
-            )
-
-        result["status"] = "COMPLETED"
-        set_step(browser_name, "ALL_URLS_CHECKED")
+                result["external_ip"] = response.json().get("ip")
+            except Exception:
+                result["external_ip"] = "Could not parse IP"
 
     except Exception as exc:
-        result["status"] = "FAILED"
+        result["error_type"] = type(exc).__name__
+        result["error"] = str(exc)[:500]
 
-        error = {
-            "type": type(exc).__name__,
-            "message": str(exc)[:1000],
-            "traceback": traceback.format_exc()[-5000:],
-        }
-
-        result["error"] = error
-
-        update_result(
-            browser_name,
-            "_error",
-            error,
-        )
-
-        update_state(
-            progress=f"{browser_name}: FAILED",
-        )
-
-        log(
-            f"{browser_name} FAILED: "
-            + json.dumps(error, ensure_ascii=False)
-        )
-
-    finally:
-        if context is not None:
-            try:
-                await asyncio.wait_for(
-                    context.close(),
-                    timeout=5,
-                )
-            except Exception as exc:
-                log(
-                    f"{browser_name} context close: "
-                    f"{type(exc).__name__}"
-                )
-
-        if browser is not None:
-            try:
-                await asyncio.wait_for(
-                    browser.close(),
-                    timeout=5,
-                )
-            except Exception as exc:
-                log(
-                    f"{browser_name} browser close: "
-                    f"{type(exc).__name__}"
-                )
-
-        result["finished_at"] = now()
-
+    result["finished_at"] = now()
     return result
 
 
-async def run_tests(browser_names):
+def run_diagnostics():
+    proxy_url = get_proxy_url()
+
+    targets = [
+        {
+            "name": "ipify",
+            "url": "https://api.ipify.org/",
+            "params": {"format": "json"},
+        },
+        {
+            "name": "ozon_home",
+            "url": "https://www.ozon.ru/",
+        },
+        {
+            "name": "ozon_catalog_api",
+            "url": (
+                "https://www.ozon.ru/"
+                "api/entrypoint-api.bx/page/json/v2"
+            ),
+            "params": {
+                "url": "/category/bluzy-i-rubashki-zhenskie-7511/"
+            },
+        },
+    ]
+
+    plans = [
+        ("requests_direct", "requests", None),
+        ("requests_proxy", "requests", proxy_url),
+        ("curl_cffi_proxy", "curl_cffi", proxy_url),
+    ]
+
     results = []
 
-    update_state(
-        result={
-            "instance_id": INSTANCE_ID,
-            "browsers": {},
-            "requested_browsers": browser_names,
-        }
-    )
-
-    async with async_playwright() as playwright:
-        for browser_name in browser_names:
-            result = await run_browser_test(
-                playwright,
-                browser_name,
-            )
-            results.append(result)
-
-    failed = any(
-        result["status"] == "FAILED"
-        for result in results
-    )
-
-    final_status = (
-        "COMPLETED_WITH_ERRORS"
-        if failed
-        else "COMPLETED"
-    )
-
-    update_state(
-        progress=final_status,
-        finished_at=now(),
-    )
-
-    log(
-        "TEST FINISHED: "
-        + json.dumps(
-            {
-                "instance_id": INSTANCE_ID,
-                "status": final_status,
-                "browsers": [
-                    {
-                        "browser": r["browser"],
-                        "status": r["status"],
-                    }
-                    for r in results
-                ],
-            },
-            ensure_ascii=False,
-        )
-    )
-
-
-def worker(browser_names):
-    update_state(
-        running=True,
-        started_at=now(),
-        finished_at=None,
-        progress="STARTING",
-        result={
-            "instance_id": INSTANCE_ID,
-            "browsers": {},
-            "requested_browsers": browser_names,
-        },
-        last_error=None,
-    )
-
     try:
-        asyncio.run(run_tests(browser_names))
+        for label, library, proxy in plans:
+            if label.endswith("_proxy") and not proxy:
+                results.append({
+                    "test": label,
+                    "skipped": True,
+                    "reason": "Proxy is not configured",
+                })
+                continue
+
+            for target in targets:
+                item = perform_request(
+                    label,
+                    library,
+                    proxy,
+                    target,
+                )
+                results.append(item)
+
+                with state_lock:
+                    state["results"] = list(results)
+
+                print(
+                    json.dumps(item, ensure_ascii=False),
+                    flush=True,
+                )
+
+                time.sleep(1)
+
+        with state_lock:
+            state["status"] = "COMPLETED"
+            state["finished_at"] = now()
 
     except Exception as exc:
-        error = {
-            "type": type(exc).__name__,
-            "message": str(exc)[:1000],
-            "traceback": traceback.format_exc()[-5000:],
-        }
-
-        update_state(
-            progress="FAILED",
-            last_error=error,
-            finished_at=now(),
-        )
-
-        log(
-            "TEST FAILED: "
-            + json.dumps(error, ensure_ascii=False)
-        )
+        with state_lock:
+            state["status"] = "FAILED"
+            state["error"] = (
+                f"{type(exc).__name__}: {str(exc)[:500]}"
+            )
+            state["finished_at"] = now()
 
     finally:
-        update_state(running=False)
+        with state_lock:
+            state["running"] = False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -505,114 +254,87 @@ class Handler(BaseHTTPRequestHandler):
             "Content-Type",
             "application/json; charset=utf-8",
         )
-        self.send_header(
-            "Cache-Control",
-            "no-store, no-cache, must-revalidate",
-        )
-        self.send_header(
-            "Content-Length",
-            str(len(body)),
-        )
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        params = parse_qs(parsed.query)
+        path = urlparse(self.path).path
 
         if path == "/health":
             self.send_json({
                 "ok": True,
-                "project": "Glukolov browser proxy test v3",
-                "port": PORT,
-                "instance_id": INSTANCE_ID,
-                "proxy_configured": bool(get_proxy()),
-                "proxy_variables_present": {
-                    name: bool(os.getenv(name))
-                    for name in (
-                        "PROXY_HOST",
-                        "PROXY_PORT",
-                        "PROXY_USER",
-                        "PROXY_PASS",
-                    )
-                },
+                "project": "Glukolov HTTP diagnostics",
+                "proxy_configured": bool(get_proxy_url()),
+                "curl_cffi_available": CURL_CFFI_AVAILABLE,
+                "browser_required": False,
             })
             return
 
-        if path == "/test":
-            browser_param = params.get(
-                "browser",
-                ["firefox"],
-            )[0].lower()
-
-            if browser_param == "both":
-                browser_names = ["chromium", "firefox"]
-            elif browser_param in ("chromium", "firefox"):
-                browser_names = [browser_param]
-            else:
-                self.send_json({
-                    "error": "Invalid browser",
-                    "allowed": ["firefox", "chromium", "both"],
-                }, 400)
-                return
-
+        if path == "/test-http":
             with state_lock:
-                already_running = state["running"]
+                if state["running"]:
+                    self.send_json({
+                        "started": False,
+                        "message": "A test is already running",
+                    })
+                    return
 
-                if not already_running:
-                    state["running"] = True
-                    state["progress"] = "QUEUED"
+                state.update({
+                    "running": True,
+                    "started_at": now(),
+                    "finished_at": None,
+                    "status": "RUNNING",
+                    "results": [],
+                    "error": None,
+                })
 
-            if not already_running:
-                thread = threading.Thread(
-                    target=worker,
-                    args=(browser_names,),
-                    daemon=True,
-                )
-                thread.start()
+            thread = threading.Thread(
+                target=run_diagnostics,
+                daemon=True,
+            )
+            thread.start()
 
             self.send_json({
-                "started": not already_running,
-                "already_running": already_running,
-                "instance_id": INSTANCE_ID,
-                "browsers": browser_names,
-                "message": (
-                    "Test started"
-                    if not already_running
-                    else "Test already running"
-                ),
+                "started": True,
+                "message": "HTTP diagnostics started",
+                "status_url": "/status",
             })
             return
 
         if path == "/status":
-            self.send_json(snapshot())
+            with state_lock:
+                snapshot = json.loads(
+                    json.dumps(state, ensure_ascii=False)
+                )
+            self.send_json(snapshot)
             return
 
         self.send_json({
-            "project": "Glukolov browser proxy test v3",
-            "instance_id": INSTANCE_ID,
-            "endpoints": {
-                "health": "/health",
-                "test_firefox": "/test?browser=firefox",
-                "test_chromium": "/test?browser=chromium",
-                "test_both": "/test?browser=both",
-                "status": "/status",
-            },
+            "project": "Glukolov HTTP diagnostics",
+            "endpoints": [
+                "/health",
+                "/test-http",
+                "/status",
+            ],
         })
 
     def log_message(self, fmt, *args):
-        log("HTTP " + (fmt % args))
+        print(
+            f"{datetime.now().isoformat()} "
+            + (fmt % args),
+            flush=True,
+        )
 
 
-log(
-    "Glukolov browser comparison v3 listening "
-    f"on port {PORT}; instance_id={INSTANCE_ID}"
+print(
+    f"Glukolov HTTP diagnostics started on port {PORT}",
+    flush=True,
 )
 
 server = ThreadingHTTPServer(
     ("0.0.0.0", PORT),
     Handler,
 )
-
 server.serve_forever()
