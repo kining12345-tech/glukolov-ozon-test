@@ -8,7 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN python -m playwright install --with-deps chromium
 
-RUN ls -la /root/.cache/ms-playwright || true
+RUN ls -la /root/.cache/ms-playwright
 
 COPY main.py .
 
