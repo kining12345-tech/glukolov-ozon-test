@@ -71,11 +71,24 @@ async def run_browser_test(playwright, browser_name):
                     "--disable-dev-shm-usage",
                 ],
             )
+
+            user_agent = (
+                "Mozilla/5.0 (Linux; Android 13; Mobile) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/141.0.0.0 Mobile Safari/537.36"
+            )
+
         elif browser_name == "firefox":
             browser = await playwright.firefox.launch(
                 headless=True,
                 proxy=proxy,
             )
+
+            user_agent = (
+                "Mozilla/5.0 (Android 13; Mobile; rv:128.0) "
+                "Gecko/128.0 Firefox/128.0"
+            )
+
         else:
             raise ValueError("Unsupported browser")
 
@@ -83,25 +96,13 @@ async def run_browser_test(playwright, browser_name):
         log(f"{browser_name}: BROWSER_STARTED")
 
         try:
+            # Firefox не поддерживает is_mobile и has_touch
+            # в Browser.new_context. Для сравнения используем
+            # одинаковые размеры окна и локаль.
             context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Linux; Android 13; Mobile) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/141.0.0.0 Mobile Safari/537.36"
-                ),
+                user_agent=user_agent,
                 locale="ru-RU",
                 viewport={"width": 390, "height": 844},
-                is_mobile=True,
-                has_touch=True,
-            ) if browser_name == "chromium" else await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Android 13; Mobile; rv:128.0) "
-                    "Gecko/128.0 Firefox/128.0"
-                ),
-                locale="ru-RU",
-                viewport={"width": 390, "height": 844},
-                is_mobile=True,
-                has_touch=True,
             )
 
             page = await context.new_page()
@@ -140,7 +141,14 @@ async def run_browser_test(playwright, browser_name):
                         )[:1000]
 
                     if name == "ozon":
-                        item["page_excerpt"] = html[:2500]
+                        # Сохраняем только видимый текст страницы,
+                        # не записывая токены challenge из HTML.
+                        try:
+                            item["page_text"] = (
+                                await page.locator("body").inner_text()
+                            )[:2500]
+                        except Exception:
+                            pass
 
                 except Exception as exc:
                     item["error"] = str(exc)
@@ -171,6 +179,7 @@ async def run_browser_test(playwright, browser_name):
                 "https://www.ozon.ru/",
             )
 
+            result["steps"].append("ALL_URLS_CHECKED")
             await context.close()
 
         finally:
@@ -212,8 +221,6 @@ async def run_all_tests():
 
 
 def worker():
-    global status
-
     with status_lock:
         if status["running"]:
             return
@@ -306,6 +313,7 @@ class Handler(BaseHTTPRequestHandler):
             "project": "Glukolov Chromium and Firefox proxy test",
             "endpoints": ["/health", "/test", "/status"],
         })
+
 
     def log_message(self, fmt, *args):
         log("HTTP " + (fmt % args))
