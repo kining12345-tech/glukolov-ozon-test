@@ -13,7 +13,6 @@ from playwright.async_api import async_playwright
 
 
 PORT = int(os.environ.get("PORT", "8000"))
-
 INSTANCE_ID = str(uuid.uuid4())[:8]
 
 state_lock = threading.Lock()
@@ -29,13 +28,12 @@ state = {
 }
 
 
+def now():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def log(message):
-    print(
-        time.strftime("%Y-%m-%d %H:%M:%S")
-        + " "
-        + str(message),
-        flush=True,
-    )
+    print(f"{now()} {message}", flush=True)
 
 
 def get_proxy():
@@ -52,9 +50,7 @@ def get_proxy():
     if not host or not port:
         return None
 
-    proxy = {
-        "server": f"http://{host}:{port}",
-    }
+    proxy = {"server": f"http://{host}:{port}"}
 
     if user:
         proxy["username"] = user
@@ -94,15 +90,25 @@ def update_result(browser_name, test_name, data):
         browser = browsers[browser_name]
 
         if test_name == "_step":
-            browser["steps"].append(data)
+            browser["steps"].append({
+                "time": now(),
+                "step": data,
+            })
         elif test_name == "_error":
             browser["error"] = data
         else:
             browser["tests"][test_name] = data
 
-        browser["updated_at"] = time.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        browser["updated_at"] = now()
+
+
+def set_step(browser_name, step):
+    progress = f"{browser_name}: {step}"
+
+    update_state(progress=progress)
+    update_result(browser_name, "_step", step)
+
+    log(progress)
 
 
 async def safe_value(awaitable, timeout=3):
@@ -113,34 +119,27 @@ async def safe_value(awaitable, timeout=3):
         )
     except Exception as exc:
         return {
-            "error": f"{type(exc).__name__}: {str(exc)[:300]}"
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:300],
         }
 
 
 async def run_browser_test(playwright, browser_name):
     proxy = get_proxy()
-
-    update_state(progress=f"{browser_name}: LAUNCHING")
-    log(f"{browser_name}: LAUNCHING")
-
-    update_result(
-        browser_name,
-        "_step",
-        "LAUNCHING",
-    )
-
     browser = None
     context = None
+    page = None
 
-    browser_result = {
+    result = {
         "browser": browser_name,
         "instance_id": INSTANCE_ID,
-        "started_at": time.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
         "proxy_configured": bool(proxy),
+        "started_at": now(),
         "tests": {},
+        "status": "RUNNING",
     }
+
+    set_step(browser_name, "LAUNCHING")
 
     try:
         if browser_name == "chromium":
@@ -182,34 +181,47 @@ async def run_browser_test(playwright, browser_name):
         else:
             raise ValueError("Unknown browser")
 
-        update_state(
-            progress=f"{browser_name}: BROWSER_STARTED"
-        )
+        set_step(browser_name, "BROWSER_STARTED")
 
-        update_result(
-            browser_name,
-            "_step",
-            "BROWSER_STARTED",
-        )
+        options = {
+            "user_agent": user_agent,
+            "locale": "ru-RU",
+            "viewport": {
+                "width": 390,
+                "height": 844,
+            },
+        }
 
-        log(f"{browser_name}: BROWSER_STARTED")
+        if browser_name == "firefox":
+            # Альтернативный путь:
+            # создаём вкладку вместе с новым контекстом.
+            set_step(browser_name, "FIREFOX_NEW_PAGE_START")
 
-        context = await asyncio.wait_for(
-            browser.new_context(
-                user_agent=user_agent,
-                locale="ru-RU",
-                viewport={
-                    "width": 390,
-                    "height": 844,
-                },
-            ),
-            timeout=15,
-        )
+            page = await asyncio.wait_for(
+                browser.new_page(**options),
+                timeout=20,
+            )
 
-        page = await asyncio.wait_for(
-            context.new_page(),
-            timeout=10,
-        )
+            context = page.context
+
+            set_step(browser_name, "FIREFOX_NEW_PAGE_OK")
+
+        else:
+            set_step(browser_name, "CHROMIUM_CONTEXT_START")
+
+            context = await asyncio.wait_for(
+                browser.new_context(**options),
+                timeout=15,
+            )
+
+            set_step(browser_name, "CHROMIUM_CONTEXT_OK")
+
+            page = await asyncio.wait_for(
+                context.new_page(),
+                timeout=10,
+            )
+
+            set_step(browser_name, "CHROMIUM_PAGE_OK")
 
         page.set_default_navigation_timeout(15000)
         page.set_default_timeout(5000)
@@ -230,20 +242,14 @@ async def run_browser_test(playwright, browser_name):
         ]
 
         for test_name, url in checks:
-            update_state(
-                progress=f"{browser_name}: {test_name.upper()}_START"
-            )
-
-            log(
-                f"{browser_name}: "
-                f"{test_name.upper()}_START"
+            set_step(
+                browser_name,
+                f"{test_name.upper()}_START",
             )
 
             item = {
                 "url": url,
-                "started_at": time.strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
+                "started_at": now(),
             }
 
             try:
@@ -259,7 +265,6 @@ async def run_browser_test(playwright, browser_name):
                 item["status"] = (
                     response.status if response else None
                 )
-
                 item["final_url"] = page.url
 
                 title = await safe_value(
@@ -276,107 +281,78 @@ async def run_browser_test(playwright, browser_name):
 
                 if isinstance(html, str):
                     item["html_length"] = len(html)
-
                     lowered = html.lower()
 
                     item["markers"] = {
-                        "challenge": (
-                            "challenge" in lowered
-                        ),
-                        "antibot": (
-                            "antibot" in lowered
-                        ),
-                        "captcha": (
-                            "captcha" in lowered
-                        ),
-                        "tilegrid": (
-                            "tilegrid" in lowered
-                        ),
-                        "pricev2": (
-                            "priceV2" in html
-                        ),
-                        "product": (
-                            "product" in lowered
-                        ),
+                        "challenge": "challenge" in lowered,
+                        "antibot": "antibot" in lowered,
+                        "captcha": "captcha" in lowered,
+                        "tilegrid": "tilegrid" in lowered,
+                        "pricev2": "priceV2" in html,
+                        "product": "product" in lowered,
                     }
                 else:
                     item["html_error"] = html
 
-                if test_name == "ipify":
+                if test_name in ("ipify", "ozon"):
                     body = await safe_value(
                         page.locator("body").inner_text(),
                         timeout=3,
                     )
 
                     if isinstance(body, str):
-                        item["body_text"] = body[:500]
+                        key = (
+                            "body_text"
+                            if test_name == "ipify"
+                            else "page_text"
+                        )
+                        limit = 500 if test_name == "ipify" else 1500
+                        item[key] = body[:limit]
                     else:
                         item["body_error"] = body
-
-                if test_name == "ozon":
-                    body = await safe_value(
-                        page.locator("body").inner_text(),
-                        timeout=3,
-                    )
-
-                    if isinstance(body, str):
-                        item["page_text"] = body[:1500]
-                    else:
-                        item["page_text_error"] = body
 
             except Exception as exc:
                 item["error_type"] = type(exc).__name__
                 item["error"] = str(exc)[:1000]
-                item["current_url"] = page.url
+
+                try:
+                    item["current_url"] = page.url
+                except Exception:
+                    pass
 
                 log(
                     f"{browser_name} {test_name} ERROR: "
-                    f"{type(exc).__name__}: {str(exc)[:500]}"
+                    f"{type(exc).__name__}: {str(exc)[:300]}"
                 )
 
-            item["finished_at"] = time.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+            item["finished_at"] = now()
 
-            # Сохраняем результат сразу после каждой проверки.
+            result["tests"][test_name] = item
+
             update_result(
                 browser_name,
                 test_name,
                 item,
             )
 
-            browser_result["tests"][test_name] = item
-
             log(
                 f"{browser_name} {test_name} RESULT: "
-                + json.dumps(
-                    item,
-                    ensure_ascii=False,
-                )
+                + json.dumps(item, ensure_ascii=False)
             )
 
-        browser_result["finished_at"] = time.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-
-        update_result(
-            browser_name,
-            "_step",
-            "ALL_URLS_CHECKED",
-        )
-
-        update_state(
-            progress=f"{browser_name}: COMPLETED"
-        )
+        result["status"] = "COMPLETED"
+        set_step(browser_name, "ALL_URLS_CHECKED")
 
     except Exception as exc:
+        result["status"] = "FAILED"
+
         error = {
             "type": type(exc).__name__,
             "message": str(exc)[:1000],
             "traceback": traceback.format_exc()[-5000:],
         }
 
-        browser_result["error"] = error
+        result["error"] = error
 
         update_result(
             browser_name,
@@ -385,15 +361,12 @@ async def run_browser_test(playwright, browser_name):
         )
 
         update_state(
-            progress=f"{browser_name}: FAILED"
+            progress=f"{browser_name}: FAILED",
         )
 
         log(
             f"{browser_name} FAILED: "
-            + json.dumps(
-                error,
-                ensure_ascii=False,
-            )
+            + json.dumps(error, ensure_ascii=False)
         )
 
     finally:
@@ -421,18 +394,13 @@ async def run_browser_test(playwright, browser_name):
                     f"{type(exc).__name__}"
                 )
 
-    return browser_result
+        result["finished_at"] = now()
+
+    return result
 
 
 async def run_tests(browser_names):
-    combined = {
-        "instance_id": INSTANCE_ID,
-        "proxy_configured": bool(get_proxy()),
-        "requested_browsers": browser_names,
-        "started_at": time.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-    }
+    results = []
 
     update_state(
         result={
@@ -444,24 +412,42 @@ async def run_tests(browser_names):
 
     async with async_playwright() as playwright:
         for browser_name in browser_names:
-            await run_browser_test(
+            result = await run_browser_test(
                 playwright,
                 browser_name,
             )
+            results.append(result)
 
-    combined["finished_at"] = time.strftime(
-        "%Y-%m-%d %H:%M:%S"
+    failed = any(
+        result["status"] == "FAILED"
+        for result in results
+    )
+
+    final_status = (
+        "COMPLETED_WITH_ERRORS"
+        if failed
+        else "COMPLETED"
     )
 
     update_state(
-        progress="COMPLETED",
-        finished_at=combined["finished_at"],
+        progress=final_status,
+        finished_at=now(),
     )
 
     log(
-        "TEST COMPLETED: "
+        "TEST FINISHED: "
         + json.dumps(
-            combined,
+            {
+                "instance_id": INSTANCE_ID,
+                "status": final_status,
+                "browsers": [
+                    {
+                        "browser": r["browser"],
+                        "status": r["status"],
+                    }
+                    for r in results
+                ],
+            },
             ensure_ascii=False,
         )
     )
@@ -470,9 +456,7 @@ async def run_tests(browser_names):
 def worker(browser_names):
     update_state(
         running=True,
-        started_at=time.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
+        started_at=now(),
         finished_at=None,
         progress="STARTING",
         result={
@@ -496,17 +480,12 @@ def worker(browser_names):
         update_state(
             progress="FAILED",
             last_error=error,
-            finished_at=time.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
+            finished_at=now(),
         )
 
         log(
             "TEST FAILED: "
-            + json.dumps(
-                error,
-                ensure_ascii=False,
-            )
+            + json.dumps(error, ensure_ascii=False)
         )
 
     finally:
@@ -514,6 +493,7 @@ def worker(browser_names):
 
 
 class Handler(BaseHTTPRequestHandler):
+
     def send_json(self, data, code=200):
         body = json.dumps(
             data,
@@ -521,24 +501,19 @@ class Handler(BaseHTTPRequestHandler):
         ).encode("utf-8")
 
         self.send_response(code)
-
         self.send_header(
             "Content-Type",
             "application/json; charset=utf-8",
         )
-
         self.send_header(
             "Cache-Control",
             "no-store, no-cache, must-revalidate",
         )
-
         self.send_header(
             "Content-Length",
             str(len(body)),
         )
-
         self.end_headers()
-
         self.wfile.write(body)
 
     def do_GET(self):
@@ -549,7 +524,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self.send_json({
                 "ok": True,
-                "project": "Glukolov browser proxy test v2",
+                "project": "Glukolov browser proxy test v3",
                 "port": PORT,
                 "instance_id": INSTANCE_ID,
                 "proxy_configured": bool(get_proxy()),
@@ -572,23 +547,13 @@ class Handler(BaseHTTPRequestHandler):
             )[0].lower()
 
             if browser_param == "both":
-                browser_names = [
-                    "chromium",
-                    "firefox",
-                ]
-            elif browser_param in (
-                "chromium",
-                "firefox",
-            ):
+                browser_names = ["chromium", "firefox"]
+            elif browser_param in ("chromium", "firefox"):
                 browser_names = [browser_param]
             else:
                 self.send_json({
                     "error": "Invalid browser",
-                    "allowed": [
-                        "firefox",
-                        "chromium",
-                        "both",
-                    ],
+                    "allowed": ["firefox", "chromium", "both"],
                 }, 400)
                 return
 
@@ -625,7 +590,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self.send_json({
-            "project": "Glukolov browser proxy test v2",
+            "project": "Glukolov browser proxy test v3",
             "instance_id": INSTANCE_ID,
             "endpoints": {
                 "health": "/health",
@@ -636,13 +601,12 @@ class Handler(BaseHTTPRequestHandler):
             },
         })
 
-
     def log_message(self, fmt, *args):
         log("HTTP " + (fmt % args))
 
 
 log(
-    "Glukolov browser comparison v2 listening "
+    "Glukolov browser comparison v3 listening "
     f"on port {PORT}; instance_id={INSTANCE_ID}"
 )
 
