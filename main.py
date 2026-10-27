@@ -7,10 +7,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urljoin, urlparse
 
 import requests
+from curl_cffi import requests as curl_requests
 
 
 PORT = int(os.getenv("PORT", "8080"))
-TIMEOUT = 12
+TIMEOUT = 20
 MAX_REDIRECTS = 5
 
 PROXY_HOST = os.getenv("PROXY_HOST", "")
@@ -40,7 +41,6 @@ HEADERS = {
         "application/xml;q=0.9,*/*;q=0.8"
     ),
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Connection": "close",
 }
 
 TARGETS = {
@@ -67,7 +67,95 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def make_session():
+def safe_response(response):
+    body = response.text[:12000]
+    content_type = response.headers.get("Content-Type", "")
+
+    markers = {
+        "widgetStates": "widgetStates" in body,
+        "tileGrid": "tileGrid" in body,
+        "priceV2": "priceV2" in body,
+        "captcha": "captcha" in body.lower(),
+        "antibot": any(
+            marker in body.lower()
+            for marker in (
+                "antibot",
+                "anti-bot",
+                "проверка браузера",
+                "подтвердите, что вы не робот",
+            )
+        ),
+        "challenge": "challenge" in body.lower(),
+        "rr": "__rr=" in response.url,
+    }
+
+    result = {
+        "status": response.status_code,
+        "url_path": urlparse(response.url).path,
+        "content_type": content_type,
+        "body_length": len(response.content),
+        "markers": markers,
+    }
+
+    if response.history:
+        result["redirect_chain"] = [
+            {
+                "status": item.status_code,
+                "path": urlparse(item.url).path,
+            }
+            for item in response.history
+        ]
+
+    if "json" in content_type.lower():
+        try:
+            data = response.json()
+
+            if isinstance(data, dict):
+                result["json_keys"] = list(data.keys())[:40]
+
+                if isinstance(data.get("widgetStates"), dict):
+                    widgets = data["widgetStates"]
+                    result["widget_count"] = len(widgets)
+
+                    sku_count = 0
+                    price_count = 0
+
+                    for value in widgets.values():
+                        if not isinstance(value, str):
+                            continue
+
+                        if any(
+                            marker in value
+                            for marker in (
+                                '"sku"',
+                                '"productId"',
+                                '"offer_id"',
+                            )
+                        ):
+                            sku_count += 1
+
+                        if "priceV2" in value:
+                            price_count += 1
+
+                    result["widgets_with_product_markers"] = sku_count
+                    result["widgets_with_priceV2"] = price_count
+
+                if "success" in data:
+                    result["success"] = data["success"]
+
+                if "error" in data:
+                    result["has_error_field"] = True
+
+        except Exception:
+            result["json_parse_error"] = True
+
+    else:
+        result["body_preview"] = body[:350].replace("\n", " ")
+
+    return result
+
+
+def run_requests_test(name, url):
     session = requests.Session()
     session.headers.update(HEADERS)
 
@@ -77,192 +165,89 @@ def make_session():
             "https": PROXY_URL,
         })
 
-    # requests.Session хранит лимит перенаправлений здесь,
-    # а не в аргументах Session.request().
     session.max_redirects = MAX_REDIRECTS
 
-    return session
-
-
-def cookie_metadata(session):
-    result = []
-
-    for cookie in session.cookies:
-        result.append({
-            "name": cookie.name,
-            "domain": cookie.domain,
-            "path": cookie.path,
-            "secure": bool(cookie.secure),
-            "expires": cookie.expires,
-        })
-
-    return result
-
-
-def safe_response(response):
-    body = response.text[:5000]
-
-    markers = {
-        "rr": "__rr=" in response.url
-              or "__rr=" in response.headers.get("Location", ""),
-        "widget_states": "widgetStates" in body,
-        "tile_grid": "tileGrid" in body,
-        "price_v2": "priceV2" in body,
-        "captcha": "captcha" in body.lower(),
-        "challenge": "challenge" in body.lower(),
-    }
-
     result = {
-        "status": response.status_code,
-        "url_path": urlparse(response.url).path,
-        "location": None,
-        "headers": {
-            "Server": response.headers.get("Server"),
-            "Content-Type": response.headers.get("Content-Type"),
-            "Content-Length": response.headers.get("Content-Length"),
-        },
-        "body_length": len(response.content),
-        "markers": markers,
-    }
-
-    location = response.headers.get("Location")
-
-    if location:
-        absolute_location = urljoin(response.url, location)
-        parsed = urlparse(absolute_location)
-
-        # Не показываем токены и прочие параметры поддержки.
-        result["location"] = (
-            parsed.scheme + "://" + parsed.netloc
-            + parsed.path
-            + (("?" + parsed.query[:300]) if parsed.query else "")
-        )
-
-    content_type = response.headers.get("Content-Type", "")
-
-    if "json" in content_type.lower():
-        try:
-            data = response.json()
-
-            # Выводим только безопасные диагностические поля.
-            if isinstance(data, dict):
-                if "incidentId" in data:
-                    result["incidentId"] = data["incidentId"]
-
-                if "success" in data:
-                    result["success"] = data["success"]
-
-                if "data" in data:
-                    result["has_data"] = data["data"] is not None
-
-                result["json_keys"] = list(data.keys())[:30]
-        except Exception:
-            pass
-    else:
-        result["body_preview"] = body[:250]
-
-    return result
-
-
-def one_request(session, url):
-    response = session.get(
-        url,
-        timeout=TIMEOUT,
-        allow_redirects=False,
-    )
-
-    result = safe_response(response)
-    response.close()
-
-    return result
-
-
-def trace_redirects(url):
-    """
-    Вручную проходим цепочку перенаправлений.
-    На каждом шаге сохраняется одна и та же cookie-сессия.
-    Токены и значения cookies в результат не попадают.
-    """
-    session = make_session()
-    steps = []
-    current_url = url
-    error = None
-
-    try:
-        for number in range(MAX_REDIRECTS + 1):
-            response = session.get(
-                current_url,
-                timeout=TIMEOUT,
-                allow_redirects=False,
-            )
-
-            step = safe_response(response)
-            step["step"] = number + 1
-            steps.append(step)
-
-            location = response.headers.get("Location")
-            status_code = response.status_code
-            response.close()
-
-            if status_code not in (301, 302, 303, 307, 308):
-                break
-
-            if not location:
-                break
-
-            if number >= MAX_REDIRECTS:
-                error = "redirect_limit_reached"
-                break
-
-            current_url = urljoin(current_url, location)
-
-    except requests.RequestException as exc:
-        error = type(exc).__name__
-
-    finally:
-        cookies = cookie_metadata(session)
-        session.close()
-
-    return {
-        "scenario": "manual_redirect_trace",
-        "initial_url_path": urlparse(url).path,
-        "steps": steps,
-        "step_count": len(steps),
-        "cookies_at_end": cookies,
-        "error": error,
-    }
-
-
-def test_target(name, url):
-    output = {
+        "client": "requests",
         "target": name,
         "started_at": now(),
     }
 
-    # Тест A: первый запрос в новой сессии.
-    session_a = make_session()
-
     try:
-        output["first_request"] = one_request(session_a, url)
-        output["cookies_after_first"] = cookie_metadata(session_a)
+        for attempt in (1, 2):
+            response = session.get(
+                url,
+                timeout=TIMEOUT,
+                allow_redirects=True,
+            )
 
-        # Тест B: повторный запрос с сохранёнными cookies.
-        output["second_request_same_session"] = one_request(
-            session_a, url
-        )
-        output["cookies_after_second"] = cookie_metadata(session_a)
+            result[f"attempt_{attempt}"] = safe_response(response)
+            response.close()
+
+            if attempt == 1:
+                time.sleep(1)
 
     except Exception as exc:
-        output["session_test_error"] = type(exc).__name__
+        result["error_type"] = type(exc).__name__
 
     finally:
-        session_a.close()
+        result["cookie_count"] = len(session.cookies)
+        session.close()
 
-    # Тест C: ручное прохождение всей цепочки 307/других редиректов.
-    output["redirect_trace"] = trace_redirects(url)
-    output["finished_at"] = now()
+    result["finished_at"] = now()
+    return result
 
-    return output
+
+def run_curl_test(name, url):
+    result = {
+        "client": "curl_cffi",
+        "target": name,
+        "impersonate": "chrome",
+        "started_at": now(),
+    }
+
+    session = None
+
+    try:
+        options = {
+            "impersonate": "chrome",
+            "headers": HEADERS,
+            "timeout": TIMEOUT,
+            "allow_redirects": True,
+            "max_redirects": MAX_REDIRECTS,
+        }
+
+        if PROXY_URL:
+            options["proxies"] = {
+                "http": PROXY_URL,
+                "https": PROXY_URL,
+            }
+
+        session = curl_requests.Session(**options)
+
+        for attempt in (1, 2):
+            response = session.get(url)
+
+            result[f"attempt_{attempt}"] = safe_response(response)
+            response.close()
+
+            if attempt == 1:
+                time.sleep(1)
+
+    except Exception as exc:
+        result["error_type"] = type(exc).__name__
+
+    finally:
+        if session is not None:
+            try:
+                result["cookie_count"] = len(session.cookies)
+            except Exception:
+                pass
+
+            session.close()
+
+    result["finished_at"] = now()
+    return result
 
 
 def run_tests():
@@ -270,27 +255,34 @@ def run_tests():
         if state["running"]:
             return False
 
-        state["running"] = True
-        state["started_at"] = now()
-        state["finished_at"] = None
-        state["status"] = "RUNNING"
-        state["results"] = []
-        state["error"] = None
+        state.update({
+            "running": True,
+            "started_at": now(),
+            "finished_at": None,
+            "status": "RUNNING",
+            "results": [],
+            "error": None,
+        })
+
+    results = []
 
     try:
-        results = []
-
+        # Сначала сравниваем клиентов на главной странице.
+        # Затем проверяем каталог.
         for name, url in TARGETS.items():
-            results.append(test_target(name, url))
+            for test_function in (
+                run_requests_test,
+                run_curl_test,
+            ):
+                result = test_function(name, url)
+                results.append(result)
 
-            with lock:
-                state["results"] = list(results)
+                with lock:
+                    state["results"] = list(results)
 
-            # Небольшая пауза между проверками.
-            time.sleep(1)
+                time.sleep(1)
 
         with lock:
-            state["results"] = results
             state["status"] = "COMPLETED"
 
     except Exception as exc:
@@ -317,7 +309,10 @@ class Handler(BaseHTTPRequestHandler):
         ).encode("utf-8")
 
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8",
+        )
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -329,7 +324,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             return self.send_json({
                 "ok": True,
-                "service": "glukolov-ozon-test",
+                "service": "glukolov-ozon-client-test",
                 "time": now(),
             })
 
@@ -349,29 +344,39 @@ class Handler(BaseHTTPRequestHandler):
                     "message": "Test already running",
                 }, 409)
 
-            thread = threading.Thread(
+            threading.Thread(
                 target=run_tests,
                 daemon=True,
-            )
-            thread.start()
+            ).start()
 
             return self.send_json({
                 "accepted": True,
-                "message": "Tests started",
+                "message": "Comparison started",
                 "status_url": "/status",
             }, 202)
 
         return self.send_json({
             "error": "not_found",
-            "available": ["/health", "/test-http", "/status"],
+            "available": [
+                "/health",
+                "/test-http",
+                "/status",
+            ],
         }, 404)
 
     def log_message(self, format, *args):
-        # Не выводим URL и заголовки запросов в журнал.
         pass
 
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print("Glukolov HTTP diagnostic service started", flush=True)
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        Handler,
+    )
+
+    print(
+        "Glukolov client comparison service started",
+        flush=True,
+    )
+
     server.serve_forever()
