@@ -3,29 +3,27 @@ import json
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
-import requests
-from curl_cffi import requests as curl_requests
+from playwright.sync_api import sync_playwright
 
 
 PORT = int(os.getenv("PORT", "8080"))
-TIMEOUT = 15
+TIMEOUT = 45000
 
-# Настройки прокси
 PROXY_HOST = os.getenv("PROXY_HOST", "").strip()
 PROXY_PORT = os.getenv("PROXY_PORT", "").strip()
 PROXY_USER = os.getenv("PROXY_USER", "")
 PROXY_PASS = os.getenv("PROXY_PASS", "")
-PROXY_URL_ENV = os.getenv("PROXY_URL", "").strip()
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
 
 lock = threading.Lock()
 
 state = {
     "running": False,
+    "status": "IDLE",
     "started_at": None,
     "finished_at": None,
-    "status": "IDLE",
     "proxy": {},
     "results": [],
     "error": None,
@@ -36,247 +34,174 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def build_proxy_url():
-    """
-    Приоритет:
-    1. PROXY_URL, если задан.
-    2. PROXY_HOST + PROXY_PORT + учётные данные.
-    """
-    if PROXY_URL_ENV:
-        return PROXY_URL_ENV
+def get_proxy():
+    if PROXY_URL:
+        return {"server": PROXY_URL}
 
     if not PROXY_HOST or not PROXY_PORT:
-        return ""
-
-    # Кодируем специальные символы в логине и пароле.
-    auth = ""
-
-    if PROXY_USER:
-        auth = quote(PROXY_USER, safe="")
-
-        if PROXY_PASS:
-            auth += ":" + quote(PROXY_PASS, safe="")
-
-        auth += "@"
-
-    # Если схема не указана, используем HTTP-прокси.
-    return f"http://{auth}{PROXY_HOST}:{PROXY_PORT}"
-
-
-PROXY_URL = build_proxy_url()
-
-
-def proxy_mapping():
-    if not PROXY_URL:
         return None
 
-    return {
-        "http": PROXY_URL,
-        "https": PROXY_URL,
+    proxy = {
+        "server": f"http://{PROXY_HOST}:{PROXY_PORT}"
     }
+
+    if PROXY_USER:
+        proxy["username"] = PROXY_USER
+
+    if PROXY_PASS:
+        proxy["password"] = PROXY_PASS
+
+    return proxy
 
 
 def proxy_info():
-    if not PROXY_URL:
-        return {
-            "configured": False,
-            "reason": "Proxy URL not configured",
-        }
+    proxy = get_proxy()
 
-    try:
-        parsed = urlsplit(PROXY_URL)
+    if not proxy:
+        return {"configured": False}
 
-        return {
-            "configured": True,
-            "host": parsed.hostname,
-            "port": parsed.port,
-            "scheme": parsed.scheme,
-            "authentication_configured": bool(
-                parsed.username
-            ),
-            "credentials_hidden": True,
-        }
-
-    except Exception:
-        return {
-            "configured": True,
-            "parse_error": True,
-            "credentials_hidden": True,
-        }
+    return {
+        "configured": True,
+        "host": PROXY_HOST or "configured in PROXY_URL",
+        "port": PROXY_PORT or None,
+        "authentication_configured": bool(
+            PROXY_USER and PROXY_PASS
+        ),
+        "credentials_hidden": True,
+    }
 
 
-def get_ip(session, label):
+def inspect_page(page, target, url):
     result = {
-        "test": label,
+        "target": target,
         "started_at": now(),
     }
 
     try:
-        response = session.get(
-            "https://api.ipify.org?format=json",
+        response = page.goto(
+            url,
+            wait_until="domcontentloaded",
             timeout=TIMEOUT,
         )
 
-        result["status_code"] = response.status_code
+        result["http_status"] = (
+            response.status if response else None
+        )
+        result["final_url"] = page.url
+        result["title"] = page.title()
 
-        if response.ok:
-            result["external_ip"] = response.json().get("ip")
+        data = page.evaluate("""() => {
+            const body = document.body?.innerText || '';
+            const html = document.documentElement?.outerHTML || '';
+
+            return {
+                body_length: body.length,
+                body_preview: body.slice(0, 700),
+                html_length: html.length,
+                product_links: document.querySelectorAll(
+                    'a[href*="/product/"]'
+                ).length,
+                price_markers: (
+                    html.includes('priceV2') ||
+                    html.includes('price_v2')
+                ),
+                widget_states: html.includes('widgetStates'),
+                tile_grid: html.includes('tileGrid'),
+                challenge_text: (
+                    /challenge|captcha|похоже, нет соединения/i
+                ).test(body),
+                product_words: (
+                    /добавить в корзину|купить|цена/i
+                ).test(body)
+            };
+        }""")
+
+        result.update(data)
 
     except Exception as exc:
+        # Не записываем текст исключения целиком:
+        # он потенциально может содержать данные подключения.
         result["error_type"] = type(exc).__name__
 
     result["finished_at"] = now()
     return result
-
-
-def test_ozon(session, label):
-    result = {
-        "test": label,
-        "started_at": now(),
-    }
-
-    try:
-        response = session.get(
-            "https://www.ozon.ru/",
-            timeout=TIMEOUT,
-            allow_redirects=True,
-        )
-
-        result.update({
-            "status_code": response.status_code,
-            "body_length": len(response.content),
-            "content_type": response.headers.get(
-                "Content-Type"
-            ),
-        })
-
-        body = response.text[:20000].lower()
-
-        result["markers"] = {
-            "widgetStates": "widgetstates" in body,
-            "tileGrid": "tilegrid" in body,
-            "priceV2": "pricev2" in body,
-            "captcha": "captcha" in body,
-            "challenge": "challenge" in body,
-            "incidentId": "incidentid" in body,
-        }
-
-    except Exception as exc:
-        result["error_type"] = type(exc).__name__
-
-    result["finished_at"] = now()
-    return result
-
-
-def direct_requests_session():
-    session = requests.Session()
-    session.trust_env = False
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        )
-    })
-    return session
-
-
-def proxy_requests_session():
-    session = requests.Session()
-    session.trust_env = False
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        )
-    })
-
-    proxies = proxy_mapping()
-
-    if proxies:
-        session.proxies.update(proxies)
-
-    return session
 
 
 def run_tests():
     with lock:
         if state["running"]:
-            return False
+            return
 
         state.update({
             "running": True,
+            "status": "RUNNING",
             "started_at": now(),
             "finished_at": None,
-            "status": "RUNNING",
             "proxy": proxy_info(),
             "results": [],
             "error": None,
         })
 
     results = []
-
-    def save(result):
-        results.append(result)
-
-        with lock:
-            state["results"] = list(results)
+    browser = None
 
     try:
-        # 1. Внешний IP без прокси
-        direct = direct_requests_session()
+        proxy = get_proxy()
 
-        try:
-            save(get_ip(direct, "IP without proxy"))
-            save(test_ozon(direct, "Ozon without proxy"))
-        finally:
-            direct.close()
+        if not proxy:
+            raise RuntimeError("Proxy is not configured")
 
-        # 2. Внешний IP через настроенный прокси
-        if not PROXY_URL:
-            save({
-                "test": "Proxy tests",
-                "error": "Proxy is not configured",
-            })
-        else:
-            proxied = proxy_requests_session()
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                proxy=proxy,
+                timeout=TIMEOUT,
+            )
 
-            try:
-                save(get_ip(proxied, "IP through proxy"))
-                save(test_ozon(proxied, "Ozon through proxy"))
-            finally:
-                proxied.close()
+            context = browser.new_context(
+                viewport={"width": 1365, "height": 900},
+                locale="ru-RU",
+                timezone_id="Europe/Moscow",
+            )
 
-            # 3. Повтор через curl_cffi с прокси
-            curl_session = None
+            page = context.new_page()
+            page.set_default_timeout(15000)
 
-            try:
-                curl_session = curl_requests.Session(
-                    impersonate="chrome",
-                    proxies=proxy_mapping(),
-                    timeout=TIMEOUT,
-                )
+            tests = [
+                (
+                    "IP through Playwright proxy",
+                    "https://api.ipify.org?format=json",
+                ),
+                (
+                    "Ozon homepage through Playwright proxy",
+                    "https://www.ozon.ru/",
+                ),
+                (
+                    "Ozon category through Playwright proxy",
+                    "https://www.ozon.ru/category/bluzy-i-rubashki-zhenskie-7511/",
+                ),
+            ]
 
-                save(get_ip(
-                    curl_session,
-                    "IP through proxy using curl_cffi",
-                ))
+            for name, url in tests:
+                result = inspect_page(page, name, url)
 
-                save(test_ozon(
-                    curl_session,
-                    "Ozon through proxy using curl_cffi",
-                ))
+                if "ipify.org" in url and "body_preview" in result:
+                    try:
+                        parsed = json.loads(
+                            result["body_preview"]
+                        )
+                        result["external_ip"] = parsed.get("ip")
+                    except Exception:
+                        pass
 
-            except Exception as exc:
-                save({
-                    "test": "curl_cffi session",
-                    "error_type": type(exc).__name__,
-                })
+                results.append(result)
 
-            finally:
-                if curl_session:
-                    curl_session.close()
+                with lock:
+                    state["results"] = list(results)
+
+            context.close()
+            browser.close()
+            browser = None
 
         with lock:
             state["status"] = "COMPLETED"
@@ -289,15 +214,18 @@ def run_tests():
             }
 
     finally:
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
         with lock:
             state["running"] = False
             state["finished_at"] = now()
 
-    return True
-
 
 class Handler(BaseHTTPRequestHandler):
-
     def send_json(self, data, status=200):
         body = json.dumps(
             data,
@@ -310,8 +238,8 @@ class Handler(BaseHTTPRequestHandler):
             "Content-Type",
             "application/json; charset=utf-8",
         )
-        self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -323,7 +251,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             return self.send_json({
                 "ok": True,
-                "service": "glukolov-proxy-diagnostic",
                 "proxy": proxy_info(),
                 "time": now(),
             })
@@ -349,8 +276,7 @@ class Handler(BaseHTTPRequestHandler):
 
             return self.send_json({
                 "accepted": True,
-                "message": "Proxy diagnostic started",
-                "status_url": "/status",
+                "message": "Playwright proxy test started",
             }, 202)
 
         return self.send_json({
@@ -367,21 +293,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(
-        "Glukolov proxy diagnostic started",
-        flush=True,
-    )
-
-    print(
-        "Proxy configured:",
-        bool(PROXY_URL),
-        flush=True,
-    )
-
-    # Не выводим PROXY_URL: он содержит пароль.
     server = ThreadingHTTPServer(
         ("0.0.0.0", PORT),
         Handler,
     )
-
+    print("Playwright proxy diagnostic started", flush=True)
     server.serve_forever()
