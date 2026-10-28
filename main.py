@@ -11,6 +11,7 @@ from playwright.sync_api import sync_playwright
 
 PORT = int(os.getenv("PORT", "8080"))
 TIMEOUT = 20000
+TEST_MAX_SECONDS = 90
 
 PROXY_HOST = os.getenv("PROXY_HOST", "").strip()
 PROXY_PORT = os.getenv("PROXY_PORT", "").strip()
@@ -18,7 +19,7 @@ PROXY_USER = os.getenv("PROXY_USER", "")
 PROXY_PASS = os.getenv("PROXY_PASS", "")
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 
-lock = threading.Lock()
+lock = threading.RLock()
 
 state = {
     "running": False,
@@ -27,6 +28,7 @@ state = {
     "finished_at": None,
     "browser": "firefox",
     "stage": None,
+    "worker_alive": False,
     "proxy": {},
     "results": [],
     "error": None,
@@ -44,9 +46,7 @@ def get_proxy():
     if not PROXY_HOST or not PROXY_PORT:
         return None
 
-    proxy = {
-        "server": f"http://{PROXY_HOST}:{PROXY_PORT}"
-    }
+    proxy = {"server": f"http://{PROXY_HOST}:{PROXY_PORT}"}
 
     if PROXY_USER:
         proxy["username"] = PROXY_USER
@@ -67,9 +67,7 @@ def proxy_info():
         "configured": True,
         "host": PROXY_HOST or "configured in PROXY_URL",
         "port": PROXY_PORT or None,
-        "authentication_configured": bool(
-            PROXY_USER and PROXY_PASS
-        ),
+        "authentication_configured": bool(PROXY_USER and PROXY_PASS),
         "credentials_hidden": True,
     }
 
@@ -77,11 +75,13 @@ def proxy_info():
 def set_stage(stage):
     with lock:
         state["stage"] = stage
+        state["last_activity_at"] = now()
 
 
 def add_result(result):
     with lock:
         state["results"].append(result)
+        state["last_activity_at"] = now()
 
 
 def inspect_page(page, target, url):
@@ -101,15 +101,13 @@ def inspect_page(page, target, url):
             timeout=TIMEOUT,
         )
 
-        result["http_status"] = (
-            response.status if response else None
-        )
+        result["http_status"] = response.status if response else None
         result["final_url"] = page.url
 
         try:
             result["title"] = page.title()
         except Exception as exc:
-            result["title_error"] = str(exc)
+            result["title_error"] = str(exc)[:1000]
 
         try:
             data = page.evaluate("""() => {
@@ -123,9 +121,8 @@ def inspect_page(page, target, url):
                     product_links: document.querySelectorAll(
                         'a[href*="/product/"]'
                     ).length,
-                    price_markers:
-                        html.includes('priceV2') ||
-                        html.includes('price_v2'),
+                    price_markers: html.includes('priceV2') ||
+                                   html.includes('price_v2'),
                     widget_states: html.includes('widgetStates'),
                     tile_grid: html.includes('tileGrid'),
                     challenge_text:
@@ -134,9 +131,7 @@ def inspect_page(page, target, url):
                         /добавить в корзину|купить|цена/i.test(body)
                 };
             }""")
-
             result.update(data)
-
         except Exception as exc:
             result["inspection_error"] = {
                 "type": type(exc).__name__,
@@ -149,9 +144,7 @@ def inspect_page(page, target, url):
                     result["body_preview"]
                 ).get("ip")
             except Exception:
-                result["ip_parse_error"] = (
-                    result["body_preview"][:200]
-                )
+                pass
 
     except Exception as exc:
         result["error"] = {
@@ -164,22 +157,6 @@ def inspect_page(page, target, url):
 
 
 def run_tests():
-    with lock:
-        if state["running"]:
-            return
-
-        state.update({
-            "running": True,
-            "status": "RUNNING",
-            "started_at": now(),
-            "finished_at": None,
-            "browser": "firefox",
-            "stage": "initializing",
-            "proxy": proxy_info(),
-            "results": [],
-            "error": None,
-        })
-
     browser = None
     context = None
 
@@ -189,8 +166,7 @@ def run_tests():
 
         if not proxy:
             raise RuntimeError(
-                "Proxy is not configured. "
-                "Check PROXY_HOST, PROXY_PORT or PROXY_URL."
+                "Proxy is not configured. Check PROXY_HOST, PROXY_PORT or PROXY_URL."
             )
 
         set_stage("starting_playwright")
@@ -229,16 +205,11 @@ def run_tests():
 
             for name, url in tests:
                 set_stage("testing: " + name)
-
                 result = inspect_page(page, name, url)
                 add_result(result)
 
-                # Не повторяем запрос к Ozon, если он уже
-                # ответил 403 или не загрузился.
                 if "Ozon homepage" in name:
-                    status = result.get("http_status")
-
-                    if status == 403:
+                    if result.get("http_status") == 403:
                         set_stage("ozon_returned_403")
                         break
 
@@ -246,9 +217,9 @@ def run_tests():
                         set_stage("ozon_navigation_failed")
                         break
 
-            with lock:
-                state["status"] = "COMPLETED"
-                state["stage"] = "finished"
+        with lock:
+            state["status"] = "COMPLETED"
+            state["stage"] = "finished"
 
     except Exception as exc:
         error_data = {
@@ -263,8 +234,7 @@ def run_tests():
             state["error"] = error_data
 
         print(
-            "GLUKOLOV TEST ERROR: "
-            + json.dumps(error_data, ensure_ascii=False),
+            "TEST ERROR: " + json.dumps(error_data, ensure_ascii=False),
             flush=True,
         )
 
@@ -276,29 +246,84 @@ def run_tests():
                 context.close()
             except Exception as exc:
                 with lock:
-                    state["cleanup_context_error"] = {
-                        "type": type(exc).__name__,
-                        "message": str(exc)[:1000],
-                    }
+                    state["cleanup_context_error"] = str(exc)[:1000]
 
         if browser:
             try:
                 browser.close()
             except Exception as exc:
                 with lock:
-                    state["cleanup_browser_error"] = {
-                        "type": type(exc).__name__,
-                        "message": str(exc)[:1000],
-                    }
+                    state["cleanup_browser_error"] = str(exc)[:1000]
 
         with lock:
             state["running"] = False
+            state["worker_alive"] = False
             state["finished_at"] = now()
 
-            if state["status"] == "RUNNING":
+            if state["status"] in ("RUNNING", "STARTING"):
                 state["status"] = "COMPLETED"
 
             state["stage"] = "finished"
+
+
+def worker_entry():
+    try:
+        run_tests()
+    except BaseException as exc:
+        with lock:
+            state["status"] = "ERROR"
+            state["error"] = {
+                "type": type(exc).__name__,
+                "message": str(exc)[:3000],
+                "traceback": traceback.format_exc()[-8000:],
+            }
+            state["running"] = False
+            state["worker_alive"] = False
+            state["finished_at"] = now()
+
+
+def start_test():
+    with lock:
+        if state["running"]:
+            return False
+
+        state.update({
+            "running": True,
+            "status": "STARTING",
+            "started_at": now(),
+            "finished_at": None,
+            "browser": "firefox",
+            "stage": "starting_worker",
+            "worker_alive": False,
+            "proxy": proxy_info(),
+            "results": [],
+            "error": None,
+            "last_activity_at": now(),
+        })
+
+        thread = threading.Thread(
+            target=worker_entry,
+            name="glukolov-firefox-test",
+            daemon=True,
+        )
+
+        try:
+            thread.start()
+            state["worker_alive"] = True
+            state["stage"] = "worker_started"
+        except Exception as exc:
+            state["running"] = False
+            state["status"] = "ERROR"
+            state["stage"] = "worker_start_failed"
+            state["finished_at"] = now()
+            state["error"] = {
+                "type": type(exc).__name__,
+                "message": str(exc)[:3000],
+                "traceback": traceback.format_exc()[-8000:],
+            }
+            return False
+
+    return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -342,38 +367,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(snapshot)
 
         if path == "/test-http":
-            with lock:
-                if state["running"]:
-                    return self.send_json({
-                        "accepted": False,
-                        "message": "Test already running",
-                        "status_url": "/status",
-                    }, 409)
+            started = start_test()
 
-                # Сразу резервируем запуск, чтобы два
-                # одновременных запроса не запустили два теста.
-                state.update({
-                    "running": True,
-                    "status": "STARTING",
-                    "started_at": now(),
-                    "finished_at": None,
-                    "browser": "firefox",
-                    "stage": "queued",
-                    "proxy": proxy_info(),
-                    "results": [],
-                    "error": None,
-                })
+            if not started:
+                with lock:
+                    snapshot = json.loads(json.dumps(state))
 
-            def worker():
-                # run_tests обычно сам устанавливает состояние,
-                # но здесь уже установлен running=True.
-                run_tests()
-
-            thread = threading.Thread(
-                target=worker,
-                daemon=True,
-            )
-            thread.start()
+                return self.send_json({
+                    "accepted": False,
+                    "message": "Test already running or worker failed to start",
+                    "status": snapshot,
+                }, 409)
 
             return self.send_json({
                 "accepted": True,
@@ -383,11 +387,7 @@ class Handler(BaseHTTPRequestHandler):
 
         return self.send_json({
             "error": "not_found",
-            "available": [
-                "/health",
-                "/test-http",
-                "/status",
-            ],
+            "available": ["/health", "/test-http", "/status"],
         }, 404)
 
     def log_message(self, format, *args):
@@ -395,14 +395,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", PORT),
-        Handler,
-    )
-
-    print(
-        f"Glukolov diagnostic started on port {PORT}",
-        flush=True,
-    )
-
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"Glukolov diagnostic started on port {PORT}", flush=True)
     server.serve_forever()
