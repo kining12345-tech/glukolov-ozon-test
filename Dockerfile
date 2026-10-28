@@ -4,6 +4,7 @@ WORKDIR /app
 
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 COPY requirements.txt .
 
