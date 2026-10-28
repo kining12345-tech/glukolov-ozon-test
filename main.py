@@ -25,7 +25,6 @@ state = {
     "status": "IDLE",
     "started_at": None,
     "finished_at": None,
-    "browser": "chromium",
     "stage": None,
     "proxy": {},
     "results": [],
@@ -37,14 +36,28 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def get_proxy():
+def proxy_info():
+    return {
+        "configured": bool(PROXY_URL or (PROXY_HOST and PROXY_PORT)),
+        "host": PROXY_HOST or ("configured in PROXY_URL" if PROXY_URL else None),
+        "port": PROXY_PORT or None,
+        "authentication_configured": bool(PROXY_USER and PROXY_PASS),
+        "credentials_hidden": True,
+        "protocols_to_test": ["http", "socks5"],
+    }
+
+
+def get_proxy(protocol):
     if PROXY_URL:
-        return {"server": PROXY_URL}
+        # Не переопределяем пользовательский URL автоматически.
+        server = PROXY_URL
+    else:
+        if not PROXY_HOST or not PROXY_PORT:
+            raise RuntimeError("PROXY_HOST or PROXY_PORT is missing")
 
-    if not PROXY_HOST or not PROXY_PORT:
-        return None
+        server = f"{protocol}://{PROXY_HOST}:{PROXY_PORT}"
 
-    proxy = {"server": f"http://{PROXY_HOST}:{PROXY_PORT}"}
+    proxy = {"server": server}
 
     if PROXY_USER:
         proxy["username"] = PROXY_USER
@@ -55,30 +68,18 @@ def get_proxy():
     return proxy
 
 
-def proxy_info():
-    if not get_proxy():
-        return {"configured": False}
-
-    return {
-        "configured": True,
-        "host": PROXY_HOST or "configured in PROXY_URL",
-        "port": PROXY_PORT or None,
-        "authentication_configured": bool(PROXY_USER and PROXY_PASS),
-        "credentials_hidden": True,
-    }
-
-
-def set_stage(stage):
+def set_stage(value):
     with lock:
-        state["stage"] = stage
+        state["stage"] = value
         state["last_activity_at"] = now()
 
 
-def inspect_page(page, target, url):
+def test_page(page, protocol, target, url):
     result = {
+        "protocol": protocol,
         "target": target,
-        "url": url,
         "started_at": now(),
+        "url": url,
     }
 
     try:
@@ -94,7 +95,7 @@ def inspect_page(page, target, url):
         try:
             result["title"] = page.title()
         except Exception as exc:
-            result["title_error"] = str(exc)[:1000]
+            result["title_error"] = str(exc)[:500]
 
         try:
             data = page.evaluate("""() => {
@@ -102,23 +103,24 @@ def inspect_page(page, target, url):
                 const html = document.documentElement?.outerHTML || '';
 
                 return {
-                    body_length: body.length,
                     body_preview: body.slice(0, 500),
+                    body_length: body.length,
                     html_length: html.length,
                     product_links: document.querySelectorAll(
                         'a[href*="/product/"]'
                     ).length,
-                    price_markers: html.includes('priceV2') ||
-                                   html.includes('price_v2'),
+                    price_markers:
+                        html.includes('priceV2') ||
+                        html.includes('price_v2'),
                     widget_states: html.includes('widgetStates'),
                     tile_grid: html.includes('tileGrid'),
                     challenge_text:
-                        /captcha|похоже, нет соединения|выключите vpn/i.test(body),
-                    product_words:
-                        /добавить в корзину|купить|цена/i.test(body)
+                        /captcha|похоже, нет соединения|выключите vpn/i.test(body)
                 };
             }""")
+
             result.update(data)
+
         except Exception as exc:
             result["inspection_error"] = {
                 "type": type(exc).__name__,
@@ -131,7 +133,7 @@ def inspect_page(page, target, url):
                     result["body_preview"]
                 ).get("ip")
             except Exception:
-                pass
+                result["ip_parse_error"] = True
 
     except Exception as exc:
         result["error"] = {
@@ -144,101 +146,125 @@ def inspect_page(page, target, url):
 
 
 def run_tests():
-    browser = None
-    context = None
-
     try:
-        set_stage("checking_proxy")
-        proxy = get_proxy()
-
-        if not proxy:
-            raise RuntimeError("Proxy is not configured")
+        if not PROXY_URL and not (PROXY_HOST and PROXY_PORT):
+            raise RuntimeError("Proxy configuration is missing")
 
         with sync_playwright() as p:
-            set_stage("launching_chromium")
+            for protocol in ("http", "socks5"):
+                set_stage(f"launching_chromium_{protocol}")
 
-            browser = p.chromium.launch(
-                headless=True,
-                proxy=proxy,
-                timeout=TIMEOUT,
-            )
-
-            set_stage("creating_context")
-
-            context = browser.new_context(
-                viewport={"width": 900, "height": 700},
-                locale="ru-RU",
-                timezone_id="Europe/Moscow",
-            )
-
-            page = context.new_page()
-            page.set_default_timeout(10000)
-
-            tests = [
-                (
-                    "Chromium external IP through proxy",
-                    "https://api.ipify.org?format=json",
-                ),
-                (
-                    "Chromium Ozon homepage through proxy",
-                    "https://www.ozon.ru/",
-                ),
-            ]
-
-            for name, url in tests:
-                set_stage("testing: " + name)
-                result = inspect_page(page, name, url)
+                protocol_result = {
+                    "protocol": protocol,
+                    "started_at": now(),
+                    "launch_ok": False,
+                }
 
                 with lock:
-                    state["results"].append(result)
+                    state["results"].append(protocol_result)
 
-                if "Ozon homepage" in name:
-                    if result.get("http_status") == 403:
-                        set_stage("ozon_returned_403")
-                        break
+                browser = None
+                context = None
 
-                    if result.get("error"):
-                        set_stage("ozon_navigation_failed")
-                        break
+                try:
+                    proxy = get_proxy(protocol)
+
+                    browser = p.chromium.launch(
+                        headless=True,
+                        proxy=proxy,
+                        timeout=TIMEOUT,
+                    )
+
+                    protocol_result["launch_ok"] = True
+                    protocol_result["launch_error"] = None
+
+                    context = browser.new_context(
+                        viewport={"width": 900, "height": 700},
+                        locale="ru-RU",
+                        timezone_id="Europe/Moscow",
+                    )
+
+                    page = context.new_page()
+                    page.set_default_timeout(10000)
+
+                    for target, url in [
+                        (
+                            "External IP",
+                            "https://api.ipify.org?format=json",
+                        ),
+                        (
+                            "Ozon homepage",
+                            "https://www.ozon.ru/",
+                        ),
+                    ]:
+                        set_stage(f"{protocol}: {target}")
+
+                        result = test_page(
+                            page,
+                            protocol,
+                            target,
+                            url,
+                        )
+
+                        with lock:
+                            state["results"].append(result)
+
+                        if target == "Ozon homepage":
+                            # 403 — это результат HTTP-запроса,
+                            # а не ошибка запуска браузера.
+                            break
+
+                except Exception as exc:
+                    protocol_result["launch_error"] = {
+                        "type": type(exc).__name__,
+                        "message": str(exc)[:2000],
+                    }
+
+                    print(
+                        f"Protocol {protocol} error: "
+                        f"{type(exc).__name__}: {str(exc)[:1000]}",
+                        flush=True,
+                    )
+
+                finally:
+                    if context:
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+
+                    if browser:
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
+
+                protocol_result["finished_at"] = now()
 
         with lock:
             state["status"] = "COMPLETED"
             state["stage"] = "finished"
 
     except Exception as exc:
-        error_data = {
+        error = {
             "type": type(exc).__name__,
             "message": str(exc)[:3000],
-            "traceback": traceback.format_exc()[-8000:],
+            "traceback": traceback.format_exc()[-6000:],
         }
 
         with lock:
             state["status"] = "ERROR"
-            state["error"] = error_data
-
-        print(
-            "TEST ERROR: " + json.dumps(error_data, ensure_ascii=False),
-            flush=True,
-        )
+            state["error"] = error
 
     finally:
-        set_stage("cleanup")
-
-        if context:
-            try:
-                context.close()
-            except Exception:
-                pass
-
-        if browser:
-            try:
-                browser.close()
-            except Exception:
-                pass
-
         with lock:
             state["running"] = False
             state["finished_at"] = now()
+            state["last_activity_at"] = now()
+
+            if state["status"] == "RUNNING":
+                state["status"] = "COMPLETED"
+
             state["stage"] = "finished"
 
 
@@ -249,18 +275,19 @@ def start_test():
 
         state.update({
             "running": True,
-            "status": "STARTING",
+            "status": "RUNNING",
             "started_at": now(),
             "finished_at": None,
-            "browser": "chromium",
-            "stage": "starting_worker",
+            "stage": "starting",
             "proxy": proxy_info(),
             "results": [],
             "error": None,
-            "last_activity_at": now(),
         })
 
-        thread = threading.Thread(target=run_tests, daemon=True)
+        thread = threading.Thread(
+            target=run_tests,
+            daemon=True,
+        )
 
         try:
             thread.start()
@@ -268,11 +295,11 @@ def start_test():
             state.update({
                 "running": False,
                 "status": "ERROR",
-                "stage": "worker_start_failed",
+                "stage": "thread_start_failed",
                 "finished_at": now(),
                 "error": {
                     "type": type(exc).__name__,
-                    "message": str(exc),
+                    "message": str(exc)[:2000],
                 },
             })
             return False
@@ -289,7 +316,10 @@ class Handler(BaseHTTPRequestHandler):
         ).encode("utf-8")
 
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8",
+        )
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -306,7 +336,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({
                 "ok": True,
                 "service": "glukolov-ozon-test",
-                "browser": "chromium",
                 "proxy": proxy_info(),
                 "time": now(),
             })
@@ -329,7 +358,7 @@ class Handler(BaseHTTPRequestHandler):
 
             return self.send_json({
                 "accepted": True,
-                "message": "Chromium proxy test started",
+                "message": "HTTP and SOCKS5 tests started",
                 "status_url": "/status",
             }, 202)
 
@@ -343,6 +372,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print("Glukolov Chromium diagnostic started", flush=True)
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        Handler,
+    )
+
+    print("Glukolov proxy protocol diagnostic started", flush=True)
     server.serve_forever()
