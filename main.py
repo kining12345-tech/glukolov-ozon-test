@@ -1,16 +1,25 @@
 import os
+import sys
 import json
+import time
 import threading
 import traceback
+import subprocess
+
 from datetime import datetime, timezone
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
-
-from camoufox.sync_api import Camoufox
 
 
 PORT = int(os.getenv("PORT", "8080"))
 TIMEOUT = 45000
+WORKER_TIMEOUT = 120
+
+DATA_DIR = Path(os.getenv("GLUKOLOV_DATA_DIR", "/tmp/glukolov"))
+STATE_FILE = DATA_DIR / "state.json"
+LOG_FILE = DATA_DIR / "camoufox.log"
+PID_FILE = DATA_DIR / "worker.pid"
 
 PROXY_HOST = os.getenv("PROXY_HOST", "").strip()
 PROXY_PORT = os.getenv("PROXY_PORT", "").strip()
@@ -20,20 +29,41 @@ PROXY_URL = os.getenv("PROXY_URL", "").strip()
 
 lock = threading.RLock()
 
-state = {
-    "running": False,
-    "status": "IDLE",
-    "started_at": None,
-    "finished_at": None,
-    "stage": None,
-    "proxy": {},
-    "results": [],
-    "error": None,
-}
-
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def ensure_dir():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def log(message):
+    ensure_dir()
+    line = f"[{now()}] {message}\n"
+
+    with lock:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+
+    print(line.rstrip(), flush=True)
+
+
+def initial_state():
+    return {
+        "running": False,
+        "status": "IDLE",
+        "started_at": None,
+        "finished_at": None,
+        "stage": None,
+        "proxy": proxy_info(),
+        "results": [],
+        "error": None,
+        "worker_pid": None,
+        "last_activity_at": None,
+    }
 
 
 def proxy_info():
@@ -54,6 +84,41 @@ def proxy_info():
     }
 
 
+def read_state():
+    ensure_dir()
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return initial_state()
+
+
+def write_state(data):
+    ensure_dir()
+    temp_file = STATE_FILE.with_suffix(".tmp")
+
+    with lock:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(temp_file, STATE_FILE)
+
+
+def update_state(**kwargs):
+    data = read_state()
+    data.update(kwargs)
+    data["last_activity_at"] = now()
+    write_state(data)
+
+
+def set_stage(stage):
+    update_state(stage=stage)
+    log(f"STAGE: {stage}")
+
+
 def get_proxy():
     if PROXY_URL:
         server = PROXY_URL
@@ -65,21 +130,15 @@ def get_proxy():
 
         server = f"http://{PROXY_HOST}:{PROXY_PORT}"
 
-    proxy = {"server": server}
+    result = {"server": server}
 
     if PROXY_USER:
-        proxy["username"] = PROXY_USER
+        result["username"] = PROXY_USER
 
     if PROXY_PASS:
-        proxy["password"] = PROXY_PASS
+        result["password"] = PROXY_PASS
 
-    return proxy
-
-
-def set_stage(value):
-    with lock:
-        state["stage"] = value
-        state["last_activity_at"] = now()
+    return result
 
 
 def inspect_page(page):
@@ -91,13 +150,13 @@ def inspect_page(page):
             document.querySelectorAll('a[href*="/product/"]')
         );
 
-        const prices = Array.from(
+        const priceElements = Array.from(
             document.querySelectorAll(
                 '[class*="price"], [data-widget*="price"]'
             )
         ).slice(0, 30).map(el => ({
-            text: (el.innerText || '').trim().slice(0, 150),
-            className: String(el.className || '').slice(0, 150)
+            text: (el.innerText || '').trim().slice(0, 120),
+            className: String(el.className || '').slice(0, 120)
         }));
 
         return {
@@ -107,7 +166,7 @@ def inspect_page(page):
             html_length: html.length,
             product_links: links.length,
             product_link_samples: links.slice(0, 10).map(a => ({
-                text: (a.innerText || '').trim().slice(0, 150),
+                text: (a.innerText || '').trim().slice(0, 120),
                 href: a.href
             })),
             price_markers:
@@ -115,7 +174,7 @@ def inspect_page(page):
                 html.includes('price_v2'),
             widget_states: html.includes('widgetStates'),
             tile_grid: html.includes('tileGrid'),
-            price_elements: prices,
+            price_elements: priceElements,
             challenge_text:
                 /captcha|похоже, нет соединения|выключите vpn|доступ ограничен/i
                     .test(body)
@@ -123,7 +182,21 @@ def inspect_page(page):
     }""")
 
 
-def run_camoufox_test():
+def worker_main():
+    ensure_dir()
+    log("WORKER STARTED")
+
+    state = read_state()
+    state.update({
+        "running": True,
+        "status": "RUNNING",
+        "stage": "worker_started",
+        "worker_pid": os.getpid(),
+        "last_activity_at": now(),
+        "error": None,
+    })
+    write_state(state)
+
     browser = None
     context = None
 
@@ -131,38 +204,30 @@ def run_camoufox_test():
         if not PROXY_URL and not (
             PROXY_HOST and PROXY_PORT
         ):
-            raise RuntimeError(
-                "Proxy configuration is missing"
-            )
+            raise RuntimeError("Proxy configuration is missing")
 
-        set_stage("launching_camoufox")
+        set_stage("importing_camoufox")
+        from camoufox.sync_api import Camoufox
 
-        result = {
-            "target": "Ozon homepage through Camoufox",
-            "browser": "Camoufox",
-            "started_at": now(),
-            "url": "https://www.ozon.ru/",
-        }
-
-        with lock:
-            state["results"].append(result)
+        log("Camoufox import successful")
 
         proxy = get_proxy()
 
-        # Запускаем только Camoufox.
-        # Никаких тестов SOCKS5 и внешнего IP.
+        # Пишем состояние до старта браузера, чтобы точно знать,
+        # на каком этапе процесс остановился.
+        set_stage("launching_camoufox")
+        log("Starting Camoufox browser")
+
         with Camoufox(
             headless=True,
             proxy=proxy,
-            geoip=True,
         ) as browser:
-            set_stage("opening_ozon")
+            log("Camoufox browser launched")
+
+            set_stage("creating_context")
 
             context = browser.new_context(
-                viewport={
-                    "width": 1365,
-                    "height": 900,
-                },
+                viewport={"width": 1365, "height": 900},
                 locale="ru-RU",
                 timezone_id="Europe/Moscow",
             )
@@ -170,7 +235,19 @@ def run_camoufox_test():
             page = context.new_page()
             page.set_default_timeout(15000)
 
-            response = None
+            result = {
+                "target": "Ozon homepage through Camoufox",
+                "browser": "Camoufox",
+                "started_at": now(),
+                "url": "https://www.ozon.ru/",
+            }
+
+            state = read_state()
+            state["results"] = [result]
+            write_state(state)
+
+            set_stage("opening_ozon")
+            log("Navigating to Ozon homepage")
 
             try:
                 response = page.goto(
@@ -184,10 +261,10 @@ def run_camoufox_test():
                 )
                 result["final_url"] = page.url
 
-                # Даём странице немного времени на выполнение JS.
-                set_stage("waiting_for_catalog")
+                set_stage("waiting_for_page")
                 page.wait_for_timeout(4000)
 
+                set_stage("inspecting_page")
                 result.update(inspect_page(page))
 
             except Exception as exc:
@@ -196,23 +273,31 @@ def run_camoufox_test():
                     "message": str(exc)[:2000],
                     "final_url": page.url,
                 }
+                log(
+                    "NAVIGATION ERROR: "
+                    f"{type(exc).__name__}: {str(exc)[:1000]}"
+                )
 
                 try:
                     result.update(inspect_page(page))
-                except Exception:
-                    pass
+                except Exception as inspect_exc:
+                    log(
+                        "INSPECTION ERROR: "
+                        f"{type(inspect_exc).__name__}: "
+                        f"{str(inspect_exc)[:1000]}"
+                    )
 
             result["finished_at"] = now()
 
             status = result.get("http_status")
             products = result.get("product_links", 0)
             challenge = result.get("challenge_text", False)
-            price_markers = result.get("price_markers", False)
 
             if status == 200 and products > 0:
                 result["verdict"] = "PRODUCTS_LOADED"
             elif status == 200 and (
-                price_markers or result.get("widget_states")
+                result.get("price_markers")
+                or result.get("widget_states")
             ):
                 result["verdict"] = "PAGE_LOADED_CHECK_PRODUCT_DATA"
             elif status == 403 or challenge:
@@ -222,88 +307,158 @@ def run_camoufox_test():
             else:
                 result["verdict"] = "NO_PRODUCTS_DETECTED"
 
-            with lock:
-                state["status"] = "COMPLETED"
-                state["stage"] = "finished"
+            state = read_state()
+            state["results"] = [result]
+            state["stage"] = "finished"
+            state["status"] = "COMPLETED"
+            state["running"] = False
+            state["finished_at"] = now()
+            state["last_activity_at"] = now()
+            write_state(state)
 
-    except Exception as exc:
+            log(f"TEST FINISHED: {result['verdict']}")
+
+    except BaseException as exc:
         error = {
             "type": type(exc).__name__,
             "message": str(exc)[:3000],
             "traceback": traceback.format_exc()[-6000:],
         }
 
-        with lock:
-            state["status"] = "ERROR"
-            state["error"] = error
-
-        print(
-            "Camoufox test error: "
-            f"{type(exc).__name__}: {str(exc)[:1000]}",
-            flush=True,
+        log(
+            "WORKER ERROR: "
+            f"{error['type']}: {error['message']}"
         )
+        log(error["traceback"])
+
+        state = read_state()
+        state.update({
+            "running": False,
+            "status": "ERROR",
+            "stage": "worker_error",
+            "finished_at": now(),
+            "last_activity_at": now(),
+            "error": error,
+        })
+        write_state(state)
 
     finally:
         if context:
             try:
                 context.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                log(f"Context close error: {exc}")
 
-        if browser:
-            try:
-                browser.close()
-            except Exception:
-                pass
+        state = read_state()
 
-        with lock:
-            state["running"] = False
-            state["finished_at"] = now()
-            state["last_activity_at"] = now()
+        # Не затираем ERROR, если произошла ошибка.
+        if state.get("status") == "RUNNING":
+            state.update({
+                "running": False,
+                "status": "COMPLETED",
+                "stage": "worker_finished",
+                "finished_at": now(),
+            })
+            write_state(state)
 
-            if state["status"] == "RUNNING":
-                state["status"] = "COMPLETED"
+        log("WORKER EXITED")
 
-            state["stage"] = "finished"
+
+def worker_is_running():
+    state = read_state()
+    pid = state.get("worker_pid")
+
+    if not state.get("running") or not pid:
+        return False
+
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def start_test():
+    ensure_dir()
+
     with lock:
-        if state["running"]:
+        current = read_state()
+
+        if current.get("running") and worker_is_running():
             return False
 
-        state.update({
+        state = {
             "running": True,
             "status": "RUNNING",
             "started_at": now(),
             "finished_at": None,
-            "stage": "starting",
+            "stage": "starting_worker",
             "proxy": proxy_info(),
             "results": [],
             "error": None,
-        })
+            "worker_pid": None,
+            "last_activity_at": now(),
+        }
+        write_state(state)
 
-        thread = threading.Thread(
-            target=run_camoufox_test,
-            daemon=True,
-        )
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n[{now()}] ===== NEW TEST =====\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+        log("Starting separate Camoufox worker process")
 
         try:
-            thread.start()
+            with open(LOG_FILE, "a", encoding="utf-8") as log_file:
+                process = subprocess.Popen(
+                    [sys.executable, os.path.abspath(__file__), "--worker"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+
+            state = read_state()
+            state["worker_pid"] = process.pid
+            state["last_activity_at"] = now()
+            write_state(state)
+
+            log(f"Worker process launched, pid={process.pid}")
+
         except Exception as exc:
+            error = {
+                "type": type(exc).__name__,
+                "message": str(exc)[:2000],
+                "traceback": traceback.format_exc()[-4000:],
+            }
+
+            state = read_state()
             state.update({
                 "running": False,
                 "status": "ERROR",
-                "stage": "thread_start_failed",
+                "stage": "worker_launch_failed",
                 "finished_at": now(),
-                "error": {
-                    "type": type(exc).__name__,
-                    "message": str(exc)[:2000],
-                },
+                "error": error,
             })
+            write_state(state)
+            log(f"Worker launch failed: {error}")
             return False
 
     return True
+
+
+def read_log_tail(max_bytes=24000):
+    ensure_dir()
+
+    try:
+        with open(LOG_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            return f.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        return f"Log read error: {exc}"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -321,18 +476,12 @@ class Handler(BaseHTTPRequestHandler):
             "application/json; charset=utf-8",
         )
         self.send_header("Cache-Control", "no-store")
-        self.send_header(
-            "Content-Length",
-            str(len(body)),
-        )
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
 
         try:
             self.wfile.write(body)
-        except (
-            BrokenPipeError,
-            ConnectionResetError,
-        ):
+        except (BrokenPipeError, ConnectionResetError):
             pass
 
     def do_GET(self):
@@ -347,31 +496,49 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         if path == "/status":
-            with lock:
-                snapshot = json.loads(
-                    json.dumps(state)
-                )
-            return self.send_json(snapshot)
+            state = read_state()
 
-        # Сохраняем старый маршрут для совместимости.
-        # Теперь он запускает только Camoufox.
-        if path in ("/test-http", "/test-camoufox"):
-            if not start_test():
-                with lock:
-                    snapshot = json.loads(
-                        json.dumps(state)
-                    )
+            if state.get("running") and not worker_is_running():
+                # Сохраняем факт неожиданного завершения процесса.
+                state.update({
+                    "running": False,
+                    "status": "WORKER_EXITED",
+                    "stage": "worker_process_not_running",
+                    "finished_at": now(),
+                    "last_activity_at": now(),
+                })
+                write_state(state)
+                log("WARNING: state says running, but worker process is absent")
 
+            return self.send_json(read_state())
+
+        if path == "/diagnostics":
+            state = read_state()
+            return self.send_json({
+                "state": state,
+                "log_tail": read_log_tail(),
+                "data_directory": str(DATA_DIR),
+                "state_file_exists": STATE_FILE.exists(),
+                "log_file_exists": LOG_FILE.exists(),
+                "worker_pid_file_exists": PID_FILE.exists(),
+            })
+
+        if path in ("/test-camoufox", "/test-http"):
+            accepted = start_test()
+
+            if not accepted:
                 return self.send_json({
                     "accepted": False,
-                    "message": "Test already running",
-                    "status": snapshot,
+                    "message": "Worker launch failed or test already running",
+                    "status_url": "/status",
+                    "diagnostics_url": "/diagnostics",
                 }, 409)
 
             return self.send_json({
                 "accepted": True,
-                "message": "Camoufox Ozon test started",
+                "message": "Camoufox worker started",
                 "status_url": "/status",
+                "diagnostics_url": "/diagnostics",
             }, 202)
 
         return self.send_json({
@@ -381,6 +548,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/status",
                 "/test-camoufox",
                 "/test-http",
+                "/diagnostics",
             ],
         }, 404)
 
@@ -389,14 +557,21 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", PORT),
-        Handler,
-    )
+    ensure_dir()
 
-    print(
-        "Glukolov Camoufox diagnostic started",
-        flush=True,
-    )
+    if len(sys.argv) > 1 and sys.argv[1] == "--worker":
+        worker_main()
+    else:
+        if not STATE_FILE.exists():
+            write_state(initial_state())
 
-    server.serve_forever()
+        print(
+            "Glukolov Camoufox diagnostic started",
+            flush=True,
+        )
+
+        server = ThreadingHTTPServer(
+            ("0.0.0.0", PORT),
+            Handler,
+        )
+        server.serve_forever()
