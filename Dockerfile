@@ -4,13 +4,12 @@ WORKDIR /app
 
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN python -m playwright install --with-deps chromium
+RUN python -m camoufox fetch
 
 COPY main.py .
 
