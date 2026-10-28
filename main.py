@@ -3,13 +3,13 @@ import json
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote
+from urllib.parse import urlsplit
 
 from playwright.sync_api import sync_playwright
 
 
 PORT = int(os.getenv("PORT", "8080"))
-TIMEOUT = 45000
+TIMEOUT = 20000
 
 PROXY_HOST = os.getenv("PROXY_HOST", "").strip()
 PROXY_PORT = os.getenv("PROXY_PORT", "").strip()
@@ -24,6 +24,7 @@ state = {
     "status": "IDLE",
     "started_at": None,
     "finished_at": None,
+    "browser": "firefox",
     "proxy": {},
     "results": [],
     "error": None,
@@ -88,39 +89,46 @@ def inspect_page(page, target, url):
             response.status if response else None
         )
         result["final_url"] = page.url
-        result["title"] = page.title()
 
-        data = page.evaluate("""() => {
-            const body = document.body?.innerText || '';
-            const html = document.documentElement?.outerHTML || '';
+        try:
+            result["title"] = page.title()
+        except Exception:
+            result["title"] = None
 
-            return {
-                body_length: body.length,
-                body_preview: body.slice(0, 700),
-                html_length: html.length,
-                product_links: document.querySelectorAll(
-                    'a[href*="/product/"]'
-                ).length,
-                price_markers: (
-                    html.includes('priceV2') ||
-                    html.includes('price_v2')
-                ),
-                widget_states: html.includes('widgetStates'),
-                tile_grid: html.includes('tileGrid'),
-                challenge_text: (
-                    /challenge|captcha|похоже, нет соединения/i
-                ).test(body),
-                product_words: (
-                    /добавить в корзину|купить|цена/i
-                ).test(body)
-            };
-        }""")
+        try:
+            data = page.evaluate("""() => {
+                const body = document.body?.innerText || '';
+                const html = document.documentElement?.outerHTML || '';
 
-        result.update(data)
+                return {
+                    body_length: body.length,
+                    body_preview: body.slice(0, 500),
+                    product_links: document.querySelectorAll(
+                        'a[href*="/product/"]'
+                    ).length,
+                    price_markers: html.includes('priceV2') ||
+                                   html.includes('price_v2'),
+                    widget_states: html.includes('widgetStates'),
+                    tile_grid: html.includes('tileGrid'),
+                    challenge_text: /captcha|похоже, нет соединения|выключите vpn/i.test(body),
+                    product_words: /добавить в корзину|купить|цена/i.test(body)
+                };
+            }""")
+
+            result.update(data)
+
+        except Exception as exc:
+            result["inspection_error"] = type(exc).__name__
+
+        if "ipify.org" in url and result.get("body_preview"):
+            try:
+                result["external_ip"] = json.loads(
+                    result["body_preview"]
+                ).get("ip")
+            except Exception:
+                pass
 
     except Exception as exc:
-        # Не записываем текст исключения целиком:
-        # он потенциально может содержать данные подключения.
         result["error_type"] = type(exc).__name__
 
     result["finished_at"] = now()
@@ -137,13 +145,15 @@ def run_tests():
             "status": "RUNNING",
             "started_at": now(),
             "finished_at": None,
+            "browser": "firefox",
             "proxy": proxy_info(),
             "results": [],
             "error": None,
         })
 
-    results = []
     browser = None
+    context = None
+    results = []
 
     try:
         proxy = get_proxy()
@@ -152,59 +162,50 @@ def run_tests():
             raise RuntimeError("Proxy is not configured")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(
+            # Только один браузер. Не запускаем Chromium.
+            browser = p.firefox.launch(
                 headless=True,
                 proxy=proxy,
                 timeout=TIMEOUT,
             )
 
             context = browser.new_context(
-                viewport={"width": 1365, "height": 900},
+                viewport={"width": 900, "height": 700},
                 locale="ru-RU",
                 timezone_id="Europe/Moscow",
             )
 
             page = context.new_page()
-            page.set_default_timeout(15000)
+            page.set_default_timeout(10000)
 
             tests = [
                 (
-                    "IP through Playwright proxy",
+                    "Firefox external IP through proxy",
                     "https://api.ipify.org?format=json",
                 ),
                 (
-                    "Ozon homepage through Playwright proxy",
+                    "Firefox Ozon homepage through proxy",
                     "https://www.ozon.ru/",
-                ),
-                (
-                    "Ozon category through Playwright proxy",
-                    "https://www.ozon.ru/category/bluzy-i-rubashki-zhenskie-7511/",
                 ),
             ]
 
             for name, url in tests:
                 result = inspect_page(page, name, url)
-
-                if "ipify.org" in url and "body_preview" in result:
-                    try:
-                        parsed = json.loads(
-                            result["body_preview"]
-                        )
-                        result["external_ip"] = parsed.get("ip")
-                    except Exception:
-                        pass
-
                 results.append(result)
 
                 with lock:
                     state["results"] = list(results)
 
-            context.close()
-            browser.close()
-            browser = None
+                # Если главная Ozon вернула 403, не тратим
+                # ресурсы на дополнительные страницы.
+                if (
+                    "Ozon homepage" in name
+                    and result.get("http_status") == 403
+                ):
+                    break
 
-        with lock:
-            state["status"] = "COMPLETED"
+            with lock:
+                state["status"] = "COMPLETED"
 
     except Exception as exc:
         with lock:
@@ -214,6 +215,12 @@ def run_tests():
             }
 
     finally:
+        if context:
+            try:
+                context.close()
+            except Exception:
+                pass
+
         if browser:
             try:
                 browser.close()
@@ -244,8 +251,6 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        from urllib.parse import urlsplit
-
         path = urlsplit(self.path).path
 
         if path == "/health":
@@ -269,14 +274,15 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "Test already running",
                     }, 409)
 
-            threading.Thread(
+            thread = threading.Thread(
                 target=run_tests,
                 daemon=True,
-            ).start()
+            )
+            thread.start()
 
             return self.send_json({
                 "accepted": True,
-                "message": "Playwright proxy test started",
+                "message": "Firefox proxy test started",
             }, 202)
 
         return self.send_json({
@@ -297,5 +303,5 @@ if __name__ == "__main__":
         ("0.0.0.0", PORT),
         Handler,
     )
-    print("Playwright proxy diagnostic started", flush=True)
+    print("Firefox proxy diagnostic started", flush=True)
     server.serve_forever()
