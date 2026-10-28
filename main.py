@@ -1,6 +1,7 @@
 import os
 import json
 import threading
+import traceback
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
@@ -25,6 +26,7 @@ state = {
     "started_at": None,
     "finished_at": None,
     "browser": "firefox",
+    "stage": None,
     "proxy": {},
     "results": [],
     "error": None,
@@ -72,10 +74,24 @@ def proxy_info():
     }
 
 
+def set_stage(stage):
+    with lock:
+        state["stage"] = stage
+
+
+def add_result(result):
+    with lock:
+        state["results"].append(result)
+
+
 def inspect_page(page, target, url):
     result = {
         "target": target,
+        "url": url,
         "started_at": now(),
+        "http_status": None,
+        "final_url": None,
+        "error": None,
     }
 
     try:
@@ -92,8 +108,8 @@ def inspect_page(page, target, url):
 
         try:
             result["title"] = page.title()
-        except Exception:
-            result["title"] = None
+        except Exception as exc:
+            result["title_error"] = str(exc)
 
         try:
             data = page.evaluate("""() => {
@@ -103,22 +119,29 @@ def inspect_page(page, target, url):
                 return {
                     body_length: body.length,
                     body_preview: body.slice(0, 500),
+                    html_length: html.length,
                     product_links: document.querySelectorAll(
                         'a[href*="/product/"]'
                     ).length,
-                    price_markers: html.includes('priceV2') ||
-                                   html.includes('price_v2'),
+                    price_markers:
+                        html.includes('priceV2') ||
+                        html.includes('price_v2'),
                     widget_states: html.includes('widgetStates'),
                     tile_grid: html.includes('tileGrid'),
-                    challenge_text: /captcha|похоже, нет соединения|выключите vpn/i.test(body),
-                    product_words: /добавить в корзину|купить|цена/i.test(body)
+                    challenge_text:
+                        /captcha|похоже, нет соединения|выключите vpn/i.test(body),
+                    product_words:
+                        /добавить в корзину|купить|цена/i.test(body)
                 };
             }""")
 
             result.update(data)
 
         except Exception as exc:
-            result["inspection_error"] = type(exc).__name__
+            result["inspection_error"] = {
+                "type": type(exc).__name__,
+                "message": str(exc)[:1000],
+            }
 
         if "ipify.org" in url and result.get("body_preview"):
             try:
@@ -126,10 +149,15 @@ def inspect_page(page, target, url):
                     result["body_preview"]
                 ).get("ip")
             except Exception:
-                pass
+                result["ip_parse_error"] = (
+                    result["body_preview"][:200]
+                )
 
     except Exception as exc:
-        result["error_type"] = type(exc).__name__
+        result["error"] = {
+            "type": type(exc).__name__,
+            "message": str(exc)[:2000],
+        }
 
     result["finished_at"] = now()
     return result
@@ -146,6 +174,7 @@ def run_tests():
             "started_at": now(),
             "finished_at": None,
             "browser": "firefox",
+            "stage": "initializing",
             "proxy": proxy_info(),
             "results": [],
             "error": None,
@@ -153,21 +182,29 @@ def run_tests():
 
     browser = None
     context = None
-    results = []
 
     try:
+        set_stage("checking_proxy_configuration")
         proxy = get_proxy()
 
         if not proxy:
-            raise RuntimeError("Proxy is not configured")
+            raise RuntimeError(
+                "Proxy is not configured. "
+                "Check PROXY_HOST, PROXY_PORT or PROXY_URL."
+            )
+
+        set_stage("starting_playwright")
 
         with sync_playwright() as p:
-            # Только один браузер. Не запускаем Chromium.
+            set_stage("launching_firefox")
+
             browser = p.firefox.launch(
                 headless=True,
                 proxy=proxy,
                 timeout=TIMEOUT,
             )
+
+            set_stage("creating_browser_context")
 
             context = browser.new_context(
                 viewport={"width": 900, "height": 700},
@@ -175,6 +212,7 @@ def run_tests():
                 timezone_id="Europe/Moscow",
             )
 
+            set_stage("creating_page")
             page = context.new_page()
             page.set_default_timeout(10000)
 
@@ -190,46 +228,77 @@ def run_tests():
             ]
 
             for name, url in tests:
+                set_stage("testing: " + name)
+
                 result = inspect_page(page, name, url)
-                results.append(result)
+                add_result(result)
 
-                with lock:
-                    state["results"] = list(results)
+                # Не повторяем запрос к Ozon, если он уже
+                # ответил 403 или не загрузился.
+                if "Ozon homepage" in name:
+                    status = result.get("http_status")
 
-                # Если главная Ozon вернула 403, не тратим
-                # ресурсы на дополнительные страницы.
-                if (
-                    "Ozon homepage" in name
-                    and result.get("http_status") == 403
-                ):
-                    break
+                    if status == 403:
+                        set_stage("ozon_returned_403")
+                        break
+
+                    if result.get("error"):
+                        set_stage("ozon_navigation_failed")
+                        break
 
             with lock:
                 state["status"] = "COMPLETED"
+                state["stage"] = "finished"
 
     except Exception as exc:
+        error_data = {
+            "type": type(exc).__name__,
+            "message": str(exc)[:3000],
+            "repr": repr(exc)[:3000],
+            "traceback": traceback.format_exc()[-8000:],
+        }
+
         with lock:
             state["status"] = "ERROR"
-            state["error"] = {
-                "type": type(exc).__name__,
-            }
+            state["error"] = error_data
+
+        print(
+            "GLUKOLOV TEST ERROR: "
+            + json.dumps(error_data, ensure_ascii=False),
+            flush=True,
+        )
 
     finally:
+        set_stage("cleanup")
+
         if context:
             try:
                 context.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                with lock:
+                    state["cleanup_context_error"] = {
+                        "type": type(exc).__name__,
+                        "message": str(exc)[:1000],
+                    }
 
         if browser:
             try:
                 browser.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                with lock:
+                    state["cleanup_browser_error"] = {
+                        "type": type(exc).__name__,
+                        "message": str(exc)[:1000],
+                    }
 
         with lock:
             state["running"] = False
             state["finished_at"] = now()
+
+            if state["status"] == "RUNNING":
+                state["status"] = "COMPLETED"
+
+            state["stage"] = "finished"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -248,7 +317,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_GET(self):
         path = urlsplit(self.path).path
@@ -256,6 +329,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             return self.send_json({
                 "ok": True,
+                "service": "glukolov-ozon-test",
+                "browser": "firefox",
                 "proxy": proxy_info(),
                 "time": now(),
             })
@@ -272,10 +347,30 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({
                         "accepted": False,
                         "message": "Test already running",
+                        "status_url": "/status",
                     }, 409)
 
+                # Сразу резервируем запуск, чтобы два
+                # одновременных запроса не запустили два теста.
+                state.update({
+                    "running": True,
+                    "status": "STARTING",
+                    "started_at": now(),
+                    "finished_at": None,
+                    "browser": "firefox",
+                    "stage": "queued",
+                    "proxy": proxy_info(),
+                    "results": [],
+                    "error": None,
+                })
+
+            def worker():
+                # run_tests обычно сам устанавливает состояние,
+                # но здесь уже установлен running=True.
+                run_tests()
+
             thread = threading.Thread(
-                target=run_tests,
+                target=worker,
                 daemon=True,
             )
             thread.start()
@@ -283,6 +378,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({
                 "accepted": True,
                 "message": "Firefox proxy test started",
+                "status_url": "/status",
             }, 202)
 
         return self.send_json({
@@ -303,5 +399,10 @@ if __name__ == "__main__":
         ("0.0.0.0", PORT),
         Handler,
     )
-    print("Firefox proxy diagnostic started", flush=True)
+
+    print(
+        f"Glukolov diagnostic started on port {PORT}",
+        flush=True,
+    )
+
     server.serve_forever()
